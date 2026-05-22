@@ -8,15 +8,23 @@ Interactive IO benchmarking harness built on [elbencho](https://github.com/breun
 
 ## Install
 
+Requirements: Python 3.11+ and (for real runs) the [elbencho](https://github.com/breuner/elbencho) binary on the coordinator and every worker.
+
 ```bash
-# 1. Set up a venv and install (pip works; uv works; pick one)
-python3 -m venv .venv
+# 1. Clone and enter the repo
+git clone https://github.com/WekaJosh/ElMaestro.git
+cd ElMaestro
+
+# 2. Create a venv and install. pip works; uv works; pick one.
+python3.11 -m venv .venv   # or `python3 -m venv .venv` if your default is 3.11+
 .venv/bin/pip install -e ".[dev,ssh,tui]"
 
-# 2. Install elbencho (the underlying benchmark tool)
-# macOS: build from source (see https://github.com/breuner/elbencho)
+# 3. Install elbencho on every machine that will run workloads.
 # Linux: grab a release binary from https://github.com/breuner/elbencho/releases
+# macOS: build from source (see the elbencho README)
 ```
+
+The `dev` extra installs pytest + ruff, `ssh` adds asyncssh (multi-client fan-out), and `tui` adds Textual. All three are optional; the harness runs with just the base deps for single-host local POSIX work.
 
 ## Commands
 
