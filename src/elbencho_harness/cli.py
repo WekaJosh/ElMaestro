@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import typer
@@ -113,7 +113,7 @@ def run(
         console.print(f"[bold]Resuming:[/bold] {run_dir}")
     else:
         run_dir = new_run_dir(base_out, label)
-        manifest = Manifest(run_id=ulid.new().str, created_at=datetime.utcnow())
+        manifest = Manifest(run_id=ulid.new().str, created_at=datetime.now(timezone.utc))
         console.print(f"[bold]Run directory:[/bold] {run_dir}")
 
     completed_hashes = {h for h, s in manifest.statuses.items() if s == "completed"}
@@ -232,6 +232,31 @@ def report(
         err_console.print(f"no result.json files found under {results_dir}")
         raise typer.Exit(code=1)
     console.print(f"[bold green]Rendered[/bold green] {len(rendered)} report(s).")
+
+
+@app.command()
+def tui(
+    config: Path = typer.Argument(..., exists=True, dir_okay=False),
+    output_dir: Path = typer.Option(
+        None, "--output-dir", "-o", help="Override output_dir from config"
+    ),
+) -> None:
+    """Open the interactive Textual UI: shows expanded specs, launches the run, live progress.
+
+    Press [r] to run, [q] to quit. The TUI tails progress live; completed specs
+    get a green status, failed specs red, errors red. Results land in the same
+    layout as `bench run`.
+    """
+    try:
+        from .tui import run_tui
+    except ImportError as e:
+        err_console.print(
+            "TUI extras aren't installed. Re-install with:\n"
+            '  pip install -e ".[dev,tui]"\n'
+            f"(import error: {e})"
+        )
+        raise typer.Exit(code=2)
+    run_tui(config, output_dir=output_dir)
 
 
 @app.command()
