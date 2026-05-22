@@ -1,40 +1,34 @@
 # elbencho-harness
 
-Interactive IO benchmarking harness built on [elbencho](https://github.com/breuner/elbencho). Drives single tests or multi-axis sweeps against local mount points or S3 endpoints, and renders self-contained HTML reports.
+Interactive IO benchmarking harness built on [elbencho](https://github.com/breuner/elbencho). Drives single tests or multi-axis sweeps against local mount points, S3 endpoints, or multi-client fleets via SSH. Renders self-contained HTML reports and supports overlay comparisons across runs.
 
 ## Status
 
-**v0.1** — local POSIX, single-host, single test, basic HTML report. Multi-client SSH fan-out, sweeps, S3, TUI, and compare reports land in later phases.
+**v0.6.** Local POSIX, S3 targets, multi-client SSH fan-out, sweep expansion (cartesian / ladder), resume, compare reports, Textual TUI. See [docs/PLAN.md](./docs/PLAN.md) for design notes.
 
 ## Install
 
 ```bash
-# 1. Install uv (Python project manager)
-brew install uv
-# or: curl -LsSf https://astral.sh/uv/install.sh | sh
+# 1. Set up a venv and install (pip works; uv works; pick one)
+python3 -m venv .venv
+.venv/bin/pip install -e ".[dev,ssh,tui]"
 
-# 2. Sync deps
-uv sync
-
-# 3. Install elbencho (the underlying benchmark tool)
+# 2. Install elbencho (the underlying benchmark tool)
 # macOS: build from source (see https://github.com/breuner/elbencho)
 # Linux: grab a release binary from https://github.com/breuner/elbencho/releases
 ```
 
-## Quick start
+## Commands
 
 ```bash
-# Validate a config without running anything
-uv run bench validate examples/single_test.yaml
-
-# Run a single test (writes results to ./results/<run-id>/)
-uv run bench run examples/single_test.yaml
-
-# Re-render the HTML report from existing results
-uv run bench report results/<run-id>/
-
-# Show version
-uv run bench version
+.venv/bin/bench version                                  # print version
+.venv/bin/bench validate examples/single_test.yaml       # parse + show summary
+.venv/bin/bench expand   examples/sweep_block_sizes.yaml # dry-run a sweep (no execution)
+.venv/bin/bench run      examples/single_test.yaml       # execute, write results, render report
+.venv/bin/bench run      <cfg> --resume results/<run-dir>  # skip completed specs on retry
+.venv/bin/bench report   results/<run-dir>/              # re-render report.html from result.json
+.venv/bin/bench compare  results/A/ results/B/           # overlay multiple runs in one HTML
+.venv/bin/bench tui      examples/sweep_block_sizes.yaml # Textual UI: live spec progress
 ```
 
 ## What's in a run
@@ -42,17 +36,30 @@ uv run bench version
 Each `bench run` produces a directory like:
 
 ```
-results/2026-05-22T14-03-11_localmnt-1m-seq-read/
+results/2026-05-22T14-03-11_sweep_bs-scan/
 ├── manifest.json
-├── 0001_localmnt_1m-seq-read/
-│   ├── result.json              # canonical result schema
+├── 0001_local-tmp_seq-read-base_bs-64KiB/
+│   ├── result.json              # canonical result schema (v1.0)
+│   ├── report.html              # per-spec Plotly report
 │   └── raw/
 │       ├── run.csv              # elbencho --csvfile output
 │       ├── run.json             # elbencho --jsonfile output
-│       └── stdout.log           # captured stdout
-└── report.html                  # self-contained Plotly report
+│       ├── stdout.log
+│       └── stderr.log           # if elbencho wrote to stderr
+├── 0002_local-tmp_seq-read-base_bs-256KiB/
+│   └── ...
+└── report.html                  # top-level pointer report
 ```
+
+## Configs
+
+A config is YAML with four sections: `clients`, `targets`, `workloads`, plus either `runs:` (explicit list) or `sweeps:` (one config, many specs). See [examples/](./examples) for working configs covering:
+
+- `single_test.yaml`: one POSIX test against `/tmp`
+- `multi_client.yaml`: three SSH workers, single workload
+- `s3_minio.yaml`: S3 target with multipart + object prefix
+- `sweep_block_sizes.yaml`: five-point cartesian sweep across block sizes
 
 ## Roadmap
 
-See [the design plan](./docs/PLAN.md) for the full multi-phase roadmap (SSH fan-out, sweeps, S3, TUI, compare).
+See [docs/PLAN.md](./docs/PLAN.md). v0.6 covers everything originally planned; longer-term ideas (full TUI editor, vendored elbencho, MinIO CI fixture) are listed there.
