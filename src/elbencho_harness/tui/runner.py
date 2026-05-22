@@ -120,7 +120,7 @@ def execute(config: Path, *, output_dir: Path | None = None) -> Iterator[Event]:
         started = datetime.now(timezone.utc)
         yield SpecStarted(index=idx, spec_hash=spec.spec_hash, started_at=started)
         try:
-            result: Result | None = run_coord(spec, spec_dir=sd)
+            result: Result | None = run_coord(spec, spec_dir=sd, engine=plan.engine)
         except CoordinatorError:
             result = None
         duration = (datetime.now(timezone.utc) - started).total_seconds()

@@ -176,6 +176,7 @@ class RunPlan(_StrictModel):
     """Top-level YAML config."""
 
     version: int = 1
+    engine: Literal["elbencho", "fio"] = "elbencho"
     output_dir: Path = Path("./results")
     clients: list[ClientHost] = Field(default_factory=lambda: [ClientHost()])
     targets: list[Target]

@@ -44,12 +44,23 @@ class ClientInfo(_Model):
     features: list[str] = Field(default_factory=list)
 
 
-class ElbenchoArtifactRefs(_Model):
+class EngineArtifactRefs(_Model):
+    """Where the engine wrote its output on disk.
+
+    Field names predate fio support; they're kept for backwards compat with
+    v1.0 result.json files. Fields that don't apply to the current engine
+    can be left None (e.g. fio populates jsonfile_path and stdout_path only).
+    """
+
     command: str
-    csv_path: str
-    jsonfile_path: str
     stdout_path: str
+    csv_path: str | None = None
+    jsonfile_path: str | None = None
     livecsv_path: str | None = None
+
+
+# Backwards-compat alias.
+ElbenchoArtifactRefs = EngineArtifactRefs
 
 
 class TargetSnapshot(_Model):
@@ -77,6 +88,7 @@ class Result(_Model):
     schema_version: str = SCHEMA_VERSION
     run_id: str
     spec_hash: str
+    engine: str = "elbencho"  # which backend produced this Result
     primary_phase: str  # which phase is the report headline
     started_at: datetime
     finished_at: datetime
@@ -84,8 +96,10 @@ class Result(_Model):
     target: TargetSnapshot
     workload: WorkloadSnapshot
     clients: list[ClientInfo]
-    elbencho: ElbenchoArtifactRefs
+    # Field name is historical: predates fio support. Holds the engine's
+    # artifact refs regardless of which engine produced them.
+    elbencho: EngineArtifactRefs
     phases: dict[str, PhaseResult]  # keyed by 'read' | 'write' | 'mixed'
-    elbencho_exit_code: int
+    elbencho_exit_code: int  # historical name; holds the engine's exit code
     errors: list[str] = Field(default_factory=list)
     notes: str = ""

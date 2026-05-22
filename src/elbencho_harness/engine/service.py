@@ -17,7 +17,7 @@ import asyncio
 import socket
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable
 
 from ..config.models import ClientHost
 from .ssh import SSHError, SSHRunner, open_runners
@@ -81,15 +81,24 @@ async def _detect_remote_version(runner: SSHRunner) -> str | None:
     return m.group(1) if m else None
 
 
-async def _start_one(runner: SSHRunner) -> ServiceEndpoint:
-    """Start the service on one host and wait until it's listening."""
+_DefaultServiceCmd = Callable[[ClientHost], list[str]]
+
+
+def _default_elbencho_service_cmd(client: ClientHost) -> list[str]:
+    return [client.elbencho_path, "--service", "--port", str(client.service_port)]
+
+
+async def _start_one(
+    runner: SSHRunner, service_command: _DefaultServiceCmd
+) -> ServiceEndpoint:
+    """Start the engine's service-mode process on one host and wait until it's listening."""
     client = runner.client
     version = await _detect_remote_version(runner)
-    cmd = [client.elbencho_path, "--service", "--port", str(client.service_port)]
+    cmd = service_command(client)
     try:
         await runner.start_background(cmd)
     except SSHError as e:
-        raise ServiceError(f"failed to start elbencho service on {client.host}: {e}") from e
+        raise ServiceError(f"failed to start service on {client.host}: {e}") from e
     try:
         await _wait_for_service(client.host, client.service_port)
     except ServiceError:
@@ -101,22 +110,28 @@ async def _start_one(runner: SSHRunner) -> ServiceEndpoint:
 
 @asynccontextmanager
 async def services_running(
-    clients: list[ClientHost], *, connect_timeout: float = 15.0
+    clients: list[ClientHost],
+    *,
+    connect_timeout: float = 15.0,
+    service_command: _DefaultServiceCmd = _default_elbencho_service_cmd,
 ) -> AsyncIterator[list[ServiceEndpoint]]:
-    """Bring up elbencho services on all clients, yield endpoints, tear down on exit.
+    """Bring up service-mode processes on all clients, yield endpoints, tear down on exit.
+
+    `service_command` is a callable that returns the argv for one client's
+    service-mode process. Default builds the elbencho command. Pass
+    backend.service_command for engine-agnostic dispatch.
 
     Concurrency: all clients connect and start in parallel. If any single one
-    fails, we tear down the rest and raise. (Partial-fanout retry would land
-    later if there's appetite for it; for now fail-loud is the right default.)
+    fails, we tear down the rest and raise.
     """
     async with open_runners(clients, connect_timeout=connect_timeout) as runners:
-        endpoints = await asyncio.gather(*(_start_one(r) for r in runners))
+        endpoints = await asyncio.gather(*(_start_one(r, service_command) for r in runners))
         try:
             yield endpoints
         finally:
             # open_runners already calls runner.close() which terminates bg procs,
             # so we don't need to do anything explicit here. We do want to give
-            # the services a beat to drain elbencho's final stats output.
+            # the services a beat to drain the engine's final stats output.
             await asyncio.sleep(0.1)
 
 

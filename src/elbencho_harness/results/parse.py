@@ -1,4 +1,13 @@
-"""Assemble a canonical Result from elbencho's CSV + JSON output."""
+"""Assemble a canonical Result, plus elbencho-specific CSV parsing helpers.
+
+`build_result` is engine-agnostic: it takes a phases dict (produced by the
+backend) plus run metadata and packages everything into a Result. Engine
+backends own the parsing of their own native output formats.
+
+The helpers _phase_from_row / _classify_phase / NON_IO_OPERATIONS are kept
+here because they're shared between the elbencho backend and the legacy
+import path; promoting them to public names is on the v0.8 cleanup list.
+"""
 
 from __future__ import annotations
 
@@ -7,17 +16,10 @@ from pathlib import Path
 from typing import Any
 
 from ..config.models import PosixTarget, RunSpec, S3Target
-from ..engine.elbencho import (
-    ElbenchoArtifacts,
-    ElbenchoVersion,
-    PhaseRow,
-    extract_percentiles,
-    parse_csv,
-    parse_jsonfile,
-)
+from ..engine.elbencho import PhaseRow
 from .schema import (
     ClientInfo,
-    ElbenchoArtifactRefs,
+    EngineArtifactRefs,
     LatencyBucket,
     PhaseResult,
     Result,
@@ -26,10 +28,10 @@ from .schema import (
 )
 
 
-# Operations that elbencho emits as phase rows but which aren't actual IO
+# Operations engines emit as phase rows but which aren't actual IO
 # (no MiB/s or IOPS, just directory / sync / cache prep work). They show up
-# in raw/run.csv for completeness, but are excluded from the Result.phases
-# dict so reports don't render null tiles.
+# in raw/ for completeness, but are excluded from the Result.phases dict so
+# reports don't render null tiles.
 NON_IO_OPERATIONS = {"mkdirs", "rmdirs", "sync", "drop_caches", "cleanup"}
 
 
@@ -59,6 +61,11 @@ def _classify_phase(operation: str) -> str:
 
 
 def _phase_from_row(row: PhaseRow, is_s3: bool) -> PhaseResult:
+    """Translate one elbencho CSV row into a PhaseResult.
+
+    Lives here (not in backends/elbencho.py) because the fio backend can
+    reuse the same PhaseResult shape and only the input format differs.
+    """
     m = row.metrics
     # On S3, treat IOPS column as ops/s; preserve POSIX iops field as null.
     iops_first = m.get("iops_first") if not is_s3 else None
@@ -94,33 +101,23 @@ def _phase_from_row(row: PhaseRow, is_s3: bool) -> PhaseResult:
 def build_result(
     *,
     run_spec: RunSpec,
-    artifacts: ElbenchoArtifacts,
-    version: ElbenchoVersion,
-    command: str,
+    engine_name: str,
+    engine_version: str | None,
+    engine_features: list[str],
+    engine_artifacts: EngineArtifactRefs,
+    phases: dict[str, PhaseResult],
     started_at: datetime,
     finished_at: datetime,
     exit_code: int,
     primary_phase: str,
     stderr_tail: str = "",
 ) -> Result:
-    rows = parse_csv(artifacts.csv)
-    json_blob: dict[str, Any] | None = parse_jsonfile(artifacts.jsonfile)
-    pct_by_label = extract_percentiles(json_blob)
+    """Package a parsed Result. Backend-agnostic.
 
-    is_s3 = isinstance(run_spec.target, S3Target)
-    phases: dict[str, PhaseResult] = {}
-    for row in rows:
-        phase = _phase_from_row(row, is_s3=is_s3)
-        # Skip non-IO phases (mkdirs, sync, cleanup). They land in raw/run.csv
-        # for the curious; the parsed Result.phases is for IO phases only.
-        if phase.operation in NON_IO_OPERATIONS:
-            continue
-        # Merge percentiles by best matching label.
-        for label, pcts in pct_by_label.items():
-            if phase.operation in label.lower() or label.lower() in phase.operation:
-                phase.latency_percentiles_us.update(pcts)
-        phases.setdefault(phase.operation, phase)
-
+    Each backend produces the `phases` dict and `engine_artifacts` references
+    in whatever format its native output uses; this function just wraps them
+    with the canonical run metadata.
+    """
     target = run_spec.target
     if isinstance(target, PosixTarget):
         tgt_snap = TargetSnapshot(
@@ -140,7 +137,6 @@ def build_result(
                 "bucket": target.bucket,
                 "region": target.region,
                 "addressing": target.addressing,
-                # credentials_ref kept out of result.json on purpose
             },
         )
     else:
@@ -163,21 +159,13 @@ def build_result(
     )
 
     clients = [
-        ClientInfo(host=c.host, elbencho_version=version.version, features=version.features)
+        ClientInfo(host=c.host, elbencho_version=engine_version, features=engine_features)
         for c in run_spec.clients
     ]
 
-    artifact_refs = ElbenchoArtifactRefs(
-        command=command,
-        csv_path=str(artifacts.csv),
-        jsonfile_path=str(artifacts.jsonfile),
-        stdout_path=str(artifacts.stdout),
-        livecsv_path=str(artifacts.livecsv) if artifacts.livecsv.is_file() else None,
-    )
-
     errors: list[str] = []
     if exit_code != 0:
-        errors.append(f"elbencho exited {exit_code}")
+        errors.append(f"{engine_name} exited {exit_code}")
         if stderr_tail:
             errors.append(stderr_tail[-2000:])
 
@@ -186,6 +174,7 @@ def build_result(
     return Result(
         run_id=run_spec.run_id,
         spec_hash=run_spec.spec_hash,
+        engine=engine_name,
         primary_phase=primary_phase,
         started_at=started_at,
         finished_at=finished_at,
@@ -193,7 +182,7 @@ def build_result(
         target=tgt_snap,
         workload=workload_snap,
         clients=clients,
-        elbencho=artifact_refs,
+        elbencho=engine_artifacts,
         phases=phases,
         elbencho_exit_code=exit_code,
         errors=errors,

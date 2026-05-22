@@ -1,0 +1,38 @@
+# Single fio test against a local mount.
+#
+# Same shape as examples/single_test.yaml but selects the fio engine. The
+# Workload model is shared between engines; each backend translates the
+# fields to its own command-line flags.
+#
+# Requirements: fio installed on the coordinator (and on each remote client
+# for multi-host runs). v0.7 supports POSIX targets only; S3 stays on the
+# elbencho engine.
+version: 1
+engine: fio
+output_dir: ./results
+
+clients:
+  - host: localhost
+    elbencho_path: fio        # path to the fio binary (field name historical)
+
+targets:
+  - name: local-tmp
+    kind: posix
+    mount_path: /tmp
+    dataset_subdir: elbencho-harness-fio
+    cleanup: false
+
+workloads:
+  - name: 1m-seq-read
+    pattern: seq
+    block_size: 1MiB
+    rw_mix_pct_read: 100
+    threads_per_client: 4
+    io_depth: 4
+    file_size: 256MiB
+    file_count: 4
+    direct_io: false        # /tmp is usually tmpfs; direct IO not supported there
+    # Free-form fio job-file lines appended verbatim. Use these for any
+    # tuning knob the schema doesn't model yet.
+    extra_flags:
+      - "ioengine=psync"

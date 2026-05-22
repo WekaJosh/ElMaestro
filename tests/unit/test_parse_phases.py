@@ -57,11 +57,15 @@ def test_non_io_operations_set_is_correct():
     assert {"mkdirs", "rmdirs", "sync", "drop_caches", "cleanup"} <= NON_IO_OPERATIONS
 
 
-def test_build_result_filters_mkdirs_phase(tmp_path):
+def test_elbencho_backend_filters_mkdirs_phase(tmp_path):
     """Regression: real WEKA run with --mkdirs added a MKDIRS row that landed
-    in result.phases as a null-metric entry. Now skipped."""
-    csv = tmp_path / "run.csv"
+    in result.phases as a null-metric entry. Now skipped at backend.parse_results
+    time."""
+    from elbencho_harness.backends.elbencho import ElbenchoBackend
+
     # Trimmed real elbencho-3.1-1 header + 3 phase rows from a WEKA run.
+    raw_dir = tmp_path
+    csv = raw_dir / "run.csv"
     csv.write_text(
         "ISO date,label,path type,paths,hosts,threads,dirs,files,file size,"
         "block size,direct IO,random,random aligned,IO depth,shared paths,truncate,"
@@ -70,40 +74,23 @@ def test_build_result_filters_mkdirs_phase(tmp_path):
         "entries [first],entries [last],MiB [first],MiB [last],"
         "Ent lat us [min],Ent lat us [avg],Ent lat us [max],"
         "IO lat us [min],IO lat us [avg],IO lat us [max]\n"
-        # MKDIRS: directory-creation phase, no IOPS / MiB/s
         "2026-05-22T16:09:38,,dir,1,1,8,1,4,268435456,1048576,1,0,,4,1,0,"
         "MKDIRS,2,5,3277,1466,,,,,8,7,8,8,,,812,1068,1378,,,\n"
-        # WRITE: real IO
         "2026-05-22T16:09:38,,dir,1,1,8,1,4,268435456,1048576,1,0,,4,1,0,"
         "WRITE,2134,2784,11,11,3494,2941,3494,2941,10,9,25,32,7460,8192,"
         "290635,609112,867164,1661,9383,120903\n"
-        # READ: real IO
         "2026-05-22T16:09:41,,dir,1,1,8,1,4,268435456,1048576,1,0,,4,1,0,"
         "READ,846,905,37,35,9673,9048,9673,9048,9,8,32,32,8192,8192,"
         "49483,214645,404799,553,3223,6922\n"
     )
-    raw = tmp_path / "run.csv"
-    json_path = tmp_path / "run.json"  # missing on purpose
-    art = artifacts_for(tmp_path)
-    # Overwrite the csv path inside artifacts (artifacts_for creates default paths).
-    art.csv = csv
-    art.jsonfile = json_path
 
-    result = build_result(
-        run_spec=_spec(),
-        artifacts=art,
-        version=ElbenchoVersion(raw="elbencho 3.1-1", version="3.1-1", features=["S3"]),
-        command="elbencho ...",
-        started_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        finished_at=datetime(2026, 1, 1, 0, 0, 10, tzinfo=timezone.utc),
-        exit_code=0,
-        primary_phase="read",
-    )
+    backend = ElbenchoBackend()
+    phases, refs = backend.parse_results(raw_dir, command="elbencho ...")
 
-    # MKDIRS must NOT be in the parsed phases dict.
-    assert "mkdirs" not in result.phases
-    # READ and WRITE must be present with their real metrics.
-    assert "read" in result.phases
-    assert "write" in result.phases
-    assert result.phases["read"].throughput_mib_s_last == 9048
-    assert result.phases["write"].throughput_mib_s_last == 2941
+    assert "mkdirs" not in phases
+    assert "read" in phases
+    assert "write" in phases
+    assert phases["read"].throughput_mib_s_last == 9048
+    assert phases["write"].throughput_mib_s_last == 2941
+    assert refs.command == "elbencho ..."
+    assert refs.csv_path == str(csv)

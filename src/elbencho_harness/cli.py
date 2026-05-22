@@ -131,7 +131,7 @@ def run(
             console.print("  [dim]✓ already completed, skipping[/dim]")
             continue
         try:
-            result: Result = run_spec(spec, spec_dir=sd, timeout_s=timeout)
+            result: Result = run_spec(spec, spec_dir=sd, timeout_s=timeout, engine=plan.engine)
         except CoordinatorError as e:
             err_console.print(f"  ✗ coordinator error: {e}")
             manifest.statuses[spec.spec_hash] = "error"

@@ -1,13 +1,15 @@
-"""Subprocess coordinator.
+"""Backend-agnostic coordinator.
+
+Drives one RunSpec through either the local-only path or the SSH fan-out
+path, dispatched on whether `clients == [localhost]`. The engine itself
+(elbencho or fio) is selected by `RunPlan.engine` and resolved via the
+backends registry; the coordinator only knows about the Backend protocol.
 
 Two execution paths:
-  - `run_locally`: v0.1 single-host, no SSH. Used when clients == [localhost].
-  - `run_fanout`:  v0.2 multi-host. Starts elbencho --service over SSH on each
-                   remote ClientHost, then runs the master elbencho command on
-                   the local machine with --hosts pointing at them.
-
-Top-level entry is `run(spec, ...)` which picks the right path based on the
-spec's client list.
+  - `run_locally`: single-host, no SSH. Used when clients == [localhost].
+  - `run_fanout`:  multi-host. Starts the engine's service-mode process over
+                   SSH on each remote ClientHost, runs the master locally
+                   with --hosts (elbencho) or --client (fio) pointing at them.
 """
 
 from __future__ import annotations
@@ -19,10 +21,10 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ..backends import Backend, get_backend
 from ..config.models import ClientHost, PosixTarget, RunSpec, S3Target
 from ..results.parse import build_result
 from ..results.schema import Result
-from .elbencho import ElbenchoVersion, artifacts_for, build_argv, detect_version
 from .service import ServiceError, hosts_arg, services_running
 
 
@@ -37,14 +39,12 @@ def _ensure_posix_dataset_dir(spec: RunSpec) -> None:
         ds.mkdir(parents=True, exist_ok=True)
 
 
-def _local_elbencho_path(spec: RunSpec) -> str:
-    """The path to elbencho on the *local* (coordinator) machine.
+def _local_path(spec: RunSpec) -> str:
+    """Path to the engine binary on the local (coordinator) machine.
 
-    For single-client local runs this is just clients[0].elbencho_path. For
-    multi-client fan-out the local machine still runs the master elbencho
-    process, so we need a binary here too. We pick the first ClientHost's
-    elbencho_path with the assumption that fleet binaries match; if your local
-    install lives elsewhere, set client[0].elbencho_path accordingly.
+    For local-only runs this is clients[0].elbencho_path. For multi-client
+    fan-out the local machine still runs the master process, so we need a
+    binary here too; same field is reused.
     """
     if spec.clients:
         return spec.clients[0].elbencho_path
@@ -64,11 +64,13 @@ def run(
     *,
     spec_dir: Path,
     timeout_s: int | None = None,
+    engine: str = "elbencho",
 ) -> Result:
     """Execute one RunSpec. Dispatches between local and fan-out automatically."""
+    backend = get_backend(engine)
     if _is_localhost_only(spec.clients):
-        return run_locally(spec, spec_dir=spec_dir, timeout_s=timeout_s)
-    return run_fanout(spec, spec_dir=spec_dir, timeout_s=timeout_s)
+        return run_locally(spec, spec_dir=spec_dir, timeout_s=timeout_s, backend=backend)
+    return run_fanout(spec, spec_dir=spec_dir, timeout_s=timeout_s, backend=backend)
 
 
 def run_locally(
@@ -76,22 +78,29 @@ def run_locally(
     *,
     spec_dir: Path,
     timeout_s: int | None = None,
+    backend: Backend | None = None,
+    engine: str = "elbencho",
 ) -> Result:
-    """Execute one RunSpec on the local host. Writes raw artifacts under
-    spec_dir/raw/ and returns a populated Result."""
-
-    elbencho_path = _local_elbencho_path(spec)
+    """Execute one RunSpec on the local host."""
+    backend = backend or get_backend(engine)
     raw_dir = spec_dir / "raw"
-    artifacts = artifacts_for(raw_dir)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    local_path = _local_path(spec)
 
     try:
-        version: ElbenchoVersion = detect_version(elbencho_path)
+        version = backend.detect_version(local_path)
     except FileNotFoundError as e:
         raise CoordinatorError(
-            f"elbencho not found at {elbencho_path!r}; install it and ensure it's in PATH"
+            f"{backend.name} not found at {local_path!r}; install it and ensure "
+            "it's in PATH (or set clients[0].elbencho_path)"
         ) from e
 
-    if isinstance(spec.target, S3Target) and not version.has("S3"):
+    support = backend.supports_target(spec.target)
+    if not support.supported:
+        raise CoordinatorError(support.reason)
+
+    # elbencho-specific S3 feature check; other backends own their own gates.
+    if backend.name == "elbencho" and isinstance(spec.target, S3Target) and not version.has("S3"):
         raise CoordinatorError(
             "elbencho was not built with S3_SUPPORT=1; rebuild with `make S3_SUPPORT=1` "
             "or use the breuner/elbencho Docker image"
@@ -99,7 +108,7 @@ def run_locally(
 
     _ensure_posix_dataset_dir(spec)
 
-    argv, primary_phase = build_argv(spec, artifacts, elbencho_path=elbencho_path)
+    argv, primary_phase = backend.build_argv(spec, raw_dir, local_path=local_path)
     command_str = " ".join(shlex.quote(p) for p in argv)
 
     env = os.environ.copy()
@@ -117,15 +126,18 @@ def run_locally(
     )
     finished = datetime.now(timezone.utc)
 
-    artifacts.stdout.write_text(proc.stdout or "")
+    (raw_dir / "stdout.log").write_text(proc.stdout or "")
     if proc.stderr:
         (raw_dir / "stderr.log").write_text(proc.stderr)
 
+    phases, artifact_refs = backend.parse_results(raw_dir, command=command_str)
     return build_result(
         run_spec=spec,
-        artifacts=artifacts,
-        version=version,
-        command=command_str,
+        engine_name=backend.name,
+        engine_version=version.version,
+        engine_features=version.features,
+        engine_artifacts=artifact_refs,
+        phases=phases,
         started_at=started,
         finished_at=finished,
         exit_code=proc.returncode,
@@ -139,14 +151,14 @@ def run_fanout(
     *,
     spec_dir: Path,
     timeout_s: int | None = None,
+    backend: Backend | None = None,
+    engine: str = "elbencho",
 ) -> Result:
-    """Multi-client run. Starts elbencho services on each client over SSH, then
-    drives the master elbencho process locally with --hosts.
-
-    Synchronous wrapper around the async core so the rest of the codebase
-    doesn't have to be async-aware.
-    """
-    return asyncio.run(_run_fanout_async(spec, spec_dir=spec_dir, timeout_s=timeout_s))
+    """Multi-client run via SSH + the engine's service/server mode."""
+    backend = backend or get_backend(engine)
+    return asyncio.run(
+        _run_fanout_async(spec, spec_dir=spec_dir, timeout_s=timeout_s, backend=backend)
+    )
 
 
 async def _run_fanout_async(
@@ -154,20 +166,25 @@ async def _run_fanout_async(
     *,
     spec_dir: Path,
     timeout_s: int | None = None,
+    backend: Backend,
 ) -> Result:
-    elbencho_path = _local_elbencho_path(spec)
     raw_dir = spec_dir / "raw"
-    artifacts = artifacts_for(raw_dir)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    local_path = _local_path(spec)
 
     try:
-        version: ElbenchoVersion = detect_version(elbencho_path)
+        version = backend.detect_version(local_path)
     except FileNotFoundError as e:
         raise CoordinatorError(
-            f"local elbencho not found at {elbencho_path!r}; the coordinator machine "
-            "needs the binary too (it runs the master process)"
+            f"local {backend.name} not found at {local_path!r}; the coordinator "
+            "machine needs the binary too (it runs the master process)"
         ) from e
 
-    if isinstance(spec.target, S3Target) and not version.has("S3"):
+    support = backend.supports_target(spec.target)
+    if not support.supported:
+        raise CoordinatorError(support.reason)
+
+    if backend.name == "elbencho" and isinstance(spec.target, S3Target) and not version.has("S3"):
         raise CoordinatorError(
             "elbencho was not built with S3_SUPPORT=1; rebuild with `make S3_SUPPORT=1`"
         )
@@ -178,19 +195,13 @@ async def _run_fanout_async(
     if isinstance(spec.target, S3Target):
         _inject_s3_credentials(env, spec.target.credentials_ref)
 
-    # Bring up services, run the master, tear down. The async-with handles
-    # cleanup on either success or failure.
     try:
-        async with services_running(spec.clients) as endpoints:
-            argv, primary_phase = build_argv(
-                spec, artifacts, elbencho_path=elbencho_path, hosts=hosts_arg(endpoints)
+        async with services_running(spec.clients, service_command=backend.service_command) as endpoints:
+            argv, primary_phase = backend.build_argv(
+                spec, raw_dir, local_path=local_path, hosts=hosts_arg(endpoints)
             )
             command_str = " ".join(shlex.quote(p) for p in argv)
-
             started = datetime.now(timezone.utc)
-            # Run master subprocess in a thread so we don't block the event
-            # loop (asyncio.create_subprocess_exec would be more idiomatic but
-            # requires reworking timeouts and capture; this is simpler).
             proc = await asyncio.to_thread(
                 subprocess.run,
                 argv,
@@ -204,15 +215,18 @@ async def _run_fanout_async(
     except ServiceError as e:
         raise CoordinatorError(f"service mode failed: {e}") from e
 
-    artifacts.stdout.write_text(proc.stdout or "")
+    (raw_dir / "stdout.log").write_text(proc.stdout or "")
     if proc.stderr:
         (raw_dir / "stderr.log").write_text(proc.stderr)
 
+    phases, artifact_refs = backend.parse_results(raw_dir, command=command_str)
     return build_result(
         run_spec=spec,
-        artifacts=artifacts,
-        version=version,
-        command=command_str,
+        engine_name=backend.name,
+        engine_version=version.version,
+        engine_features=version.features,
+        engine_artifacts=artifact_refs,
+        phases=phases,
         started_at=started,
         finished_at=finished,
         exit_code=proc.returncode,

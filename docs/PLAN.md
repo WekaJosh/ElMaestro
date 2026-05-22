@@ -5,21 +5,23 @@ not by what's easiest. Each phase ships a working `bench run` end to end. No hal
 
 ## Where we are
 
-**v0.1 (shipped, commit a7016f5):** local POSIX, single host, single test per invocation,
-self-contained HTML report. Pydantic models already define the shape of multi-client and
-sweep configs but the loader and coordinator only honor `runs:` against `localhost`.
+**v0.7 (shipped).** Engine-agnostic via the Backend protocol; elbencho (POSIX + S3) and fio
+(POSIX) both register. Multi-client SSH fan-out works for either engine. Sweeps, resume,
+compare reports, and the Textual TUI all work backend-agnostically.
 
-What works today:
-- `bench validate` / `bench run` / `bench report` / `bench version`
-- POSIX target, sequential or random, read/write mix, direct IO, drop-caches
-- `result.json` (schema 1.0), `manifest.json`, single-run Plotly report
+Earlier phases (all shipped):
+- **v0.1:** local POSIX, single-host, single test, basic HTML report (elbencho).
+- **v0.2:** SSH fan-out via elbencho's service mode.
+- **v0.3:** sweep expansion (cartesian / ladder) + resume.
+- **v0.4:** compare reports.
+- **v0.5:** S3 targets wired through with multipart / object prefix knobs.
+- **v0.6:** Textual TUI with live spec progress.
+- **v0.7:** fio engine alongside elbencho, selected via top-level `engine:` field.
 
-What doesn't:
-- Sweeps (`SweepAxis`, `Sweep` defined but never expanded into `RunSpec` list)
-- Multi-host (single `ClientHost` only; `ssh_user`, `service_port` etc. ignored)
-- S3 (`S3Target` defined, never reaches elbencho)
-- Compare report (no way to view N runs side by side)
-- TUI (`textual` reserved in pyproject, not installed)
+What's deferred (see Non-goals + Open questions below):
+- fio + S3
+- Full TUI editor (form widgets for every Pydantic field)
+- Vendored engine binaries / one-line "set up a POV box" script
 
 ## Phase plan
 
@@ -152,9 +154,10 @@ extra). Probably needs structlog -> rich/textual bridge for clean log capture.
 - Continuous benchmarking / scheduled runs / CI integration
 - Storing results in a database (filesystem layout is the source of truth)
 - Web UI / hosted dashboard
-- Anything that requires running as root beyond what elbencho already needs (drop-caches)
-- Driving non-elbencho tools (fio, iozone). If we want that later it's a sibling project,
-  not a backend swap.
+- Anything that requires running as root beyond what the engine itself needs (drop-caches,
+  direct IO on raw devices)
+- Driving iozone, vdbench, or other legacy IO tools. The Backend protocol could host one,
+  but priority is the elbencho + fio pair.
 - Cross-cloud cost reporting
 
 ## Things to revisit before v0.3
@@ -171,7 +174,14 @@ extra). Probably needs structlog -> rich/textual bridge for clean log capture.
 
 - elbencho's `--csvfile` and `--jsonfile` outputs don't fully overlap; we parse both. Long
   term, pick one and document why.
-- macOS dev experience: `brew install elbencho` doesn't exist. Either ship a small build
-  script, or accept that macOS dev uses the fake fixture and real runs happen on Linux.
-- Should we vendor a pinned elbencho version (download a release binary on first run)?
+- macOS dev experience for elbencho: `brew install elbencho` doesn't exist. Either ship a
+  small build script, or accept that macOS dev uses the fake fixtures and real runs happen
+  on Linux. (fio doesn't have this problem: `brew install fio` works.)
+- Should we vendor pinned engine versions (download a release binary on first run)?
   Trade-off: reproducibility vs surprise downloads.
+- The `ClientHost.elbencho_path` field is mis-named now that it can point at fio. Rename
+  to `engine_path` in v0.8 with a deprecation alias.
+- `Result.elbencho` and `Result.elbencho_exit_code` are similarly historical. Rename to
+  `Result.engine_artifacts` / `Result.engine_exit_code` with backward-compat aliases.
+- fio + S3: defer until someone needs it, then evaluate `--ioengine=http` vs the rados-s3
+  plugin against elbencho's existing S3 support.
