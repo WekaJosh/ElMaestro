@@ -25,4 +25,5 @@ venv/
 
 # Local results from runs
 results/
+results-smoke/
 *.log

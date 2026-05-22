@@ -3,7 +3,7 @@ output_dir: ./results-smoke
 
 clients:
   - host: localhost
-    elbencho_path: /Users/josh.h/benchmark-wrapper/tests/fixtures/fake_elbencho.sh
+    elbencho_path: /Users/josh.h/Documents/code/benchmark-wrapper/tests/fixtures/fake_elbencho.sh
 
 targets:
   - name: local-tmp
