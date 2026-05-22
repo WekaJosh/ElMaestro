@@ -30,10 +30,15 @@ dev = [
     "mypy",
     "types-PyYAML",
 ]
-# Reserved for later phases:
-# tui = ["textual>=0.80,<1.0", "textual-plotext>=0.4"]
-# ssh = ["asyncssh>=2.14,<3"]
-# data = ["pandas>=2.2,<3"]
+ssh = ["asyncssh>=2.14,<3"]
+tui = ["textual>=0.80,<1.0", "textual-plotext>=0.4"]
+data = ["pandas>=2.2,<3"]
+all = [
+    "asyncssh>=2.14,<3",
+    "textual>=0.80,<1.0",
+    "textual-plotext>=0.4",
+    "pandas>=2.2,<3",
+]
 
 [project.scripts]
 bench = "elbencho_harness.cli:main"
@@ -53,3 +58,6 @@ ignore = ["E501"]
 python_version = "3.11"
 strict = false
 ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

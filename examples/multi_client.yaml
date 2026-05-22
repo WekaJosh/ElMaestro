@@ -1,0 +1,50 @@
+# Multi-client elbencho-harness run.
+#
+# v0.2 starts `elbencho --service` over SSH on each ClientHost, then runs the
+# master elbencho process on the local machine with --hosts pointing at them.
+# The local machine still needs elbencho installed (it runs the master).
+#
+# Adjust hosts, ssh_user, ssh_key, and mount_path for your fleet before running.
+version: 1
+output_dir: ./results
+
+clients:
+  - host: worker-01.example.com
+    ssh_user: bench
+    ssh_port: 22
+    ssh_key: ~/.ssh/id_ed25519
+    elbencho_path: /usr/local/bin/elbencho
+    service_port: 1611
+  - host: worker-02.example.com
+    ssh_user: bench
+    ssh_key: ~/.ssh/id_ed25519
+    elbencho_path: /usr/local/bin/elbencho
+    service_port: 1611
+  - host: worker-03.example.com
+    ssh_user: bench
+    ssh_key: ~/.ssh/id_ed25519
+    elbencho_path: /usr/local/bin/elbencho
+    service_port: 1611
+
+targets:
+  - name: weka-pov
+    kind: posix
+    mount_path: /mnt/weka
+    dataset_subdir: elbencho-harness-bench
+    cleanup: false
+
+workloads:
+  - name: 1m-seq-read-fanout
+    pattern: seq
+    block_size: 1MiB
+    rw_mix_pct_read: 100
+    threads_per_client: 16
+    io_depth: 4
+    file_size: 4GiB
+    file_count: 8
+    direct_io: true
+    drop_caches_before: true
+
+runs:
+  - target: weka-pov
+    workload: 1m-seq-read-fanout

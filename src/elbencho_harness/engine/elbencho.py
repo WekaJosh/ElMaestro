@@ -96,12 +96,17 @@ def build_argv(
     elbencho_path: str = "elbencho",
     include_livecsv: bool = False,
     live_interval_ms: int = 1000,
+    hosts: str | None = None,
 ) -> tuple[list[str], str]:
     """Build the elbencho command line for a RunSpec.
 
     Returns (argv, primary_phase). primary_phase is the phase whose numbers are
     the headline in the report (e.g. 'read' for a 100/0 workload that was
     populated by an implicit write phase).
+
+    `hosts`, when provided, is passed as elbencho's --hosts flag for multi-client
+    coordination (e.g. "host1:1611,host2:1611"). The coordinator constructs this
+    after starting service-mode elbencho on each remote host.
     """
     wl = run_spec.workload
     argv: list[str] = [elbencho_path]
@@ -114,6 +119,10 @@ def build_argv(
 
     if include_livecsv:
         argv += ["--livecsv", str(artifacts.livecsv), "--liveint", str(live_interval_ms)]
+
+    # Multi-client fan-out.
+    if hosts:
+        argv += ["--hosts", hosts]
 
     # Workload basics.
     argv += ["-b", str(wl.block_size)]

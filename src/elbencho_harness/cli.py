@@ -13,7 +13,7 @@ from rich.table import Table
 from . import __version__
 from .config.loader import load_run_plan
 from .config.models import ClientHost, RunSpec
-from .engine.coordinator import CoordinatorError, run_locally
+from .engine.coordinator import CoordinatorError, run as run_spec
 from .report.render import render_single
 from .results.schema import Result
 from .results.store import (
@@ -106,7 +106,7 @@ def run(
             f"(spec_hash={spec.spec_hash[:18]}…)"
         )
         try:
-            result: Result = run_locally(spec, spec_dir=sd, timeout_s=timeout)
+            result: Result = run_spec(spec, spec_dir=sd, timeout_s=timeout)
         except CoordinatorError as e:
             err_console.print(f"  ✗ coordinator error: {e}")
             manifest.statuses[spec.spec_hash] = "error"
