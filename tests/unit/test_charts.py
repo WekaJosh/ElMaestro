@@ -11,6 +11,7 @@ from elbencho_harness.report.charts import (
     axis_pretty_name,
     detect_common_axis,
     format_axis_value,
+    overlay_with_toggle,
     sweep_overlay,
 )
 
@@ -151,15 +152,44 @@ def test_sweep_overlay_initial_mode_line_makes_lines_visible():
     assert scatter_traces[0].visible is True
 
 
-def test_sweep_overlay_has_bar_line_toggle_buttons():
+def test_sweep_overlay_has_no_plotly_updatemenus():
+    """The Bar/Line toggle is rendered as HTML over the chart, not as a
+    Plotly updatemenu. Plotly's button styling fights dark themes."""
     fig = sweep_overlay(
         title="t", x_labels=["a"], x_axis_title="", y_title="",
         series=[("r", [1])],
     )
-    assert fig.layout.updatemenus
-    menu = fig.layout.updatemenus[0]
-    labels = [b.label for b in menu.buttons]
-    assert labels == ["Bar", "Line"]
+    # In Plotly an absent updatemenus is an empty tuple, not None.
+    assert not fig.layout.updatemenus
+
+
+def test_overlay_with_toggle_includes_both_buttons():
+    fig = sweep_overlay(
+        title="t", x_labels=["a", "b"], x_axis_title="", y_title="",
+        series=[("r", [1, 2])],
+    )
+    html = overlay_with_toggle(fig, n_series=1)
+    assert 'data-mode="bar"' in html
+    assert 'data-mode="line"' in html
+    assert 'data-nseries="1"' in html
+    assert 'class="chart-wrapper"' in html
+    assert ">Bar</button>" in html
+    assert ">Line</button>" in html
+
+
+def test_overlay_with_toggle_marks_initial_mode_active():
+    fig = sweep_overlay(
+        title="t", x_labels=["a"], x_axis_title="", y_title="",
+        series=[("r", [1])],
+    )
+    bar_initial = overlay_with_toggle(fig, n_series=1, initial_mode="bar")
+    # The Bar button has class="active", the Line one doesn't.
+    assert 'data-mode="bar" class="active"' in bar_initial
+    assert 'data-mode="line" class=""' in bar_initial
+
+    line_initial = overlay_with_toggle(fig, n_series=1, initial_mode="line")
+    assert 'data-mode="bar" class=""' in line_initial
+    assert 'data-mode="line" class="active"' in line_initial
 
 
 def test_sweep_overlay_handles_none_values_without_crashing():

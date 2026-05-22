@@ -25,6 +25,7 @@ from .charts import (
     axis_pretty_name,
     detect_common_axis,
     format_axis_value,
+    overlay_with_toggle,
     render_figure_html,
     sweep_overlay,
 )
@@ -293,14 +294,15 @@ def render_compare(
         lstrip_blocks=True,
     )
     template = env.get_template("compare.html.j2")
+    n_series = len(runs)
     html = template.render(
         title=title,
         runs=runs,
         rows=rows,
         baseline=baseline,
-        throughput_html=render_figure_html(throughput_overlay(runs)),
-        iops_html=render_figure_html(iops_overlay(runs)),
-        latency_html=render_figure_html(latency_overlay(runs)),
+        throughput_html=overlay_with_toggle(throughput_overlay(runs), n_series=n_series),
+        iops_html=overlay_with_toggle(iops_overlay(runs), n_series=n_series),
+        latency_html=overlay_with_toggle(latency_overlay(runs), n_series=n_series),
     )
     out_path.write_text(html, encoding="utf-8")
     return out_path

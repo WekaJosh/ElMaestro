@@ -113,34 +113,33 @@ def _apply_theme(
     )
 
 
-def _toggle_buttons(*, n_series: int) -> list[dict]:
-    """Update-menu buttons that flip between Bar and Line trace visibility.
+def overlay_with_toggle(
+    fig: go.Figure, *, n_series: int, initial_mode: str = "bar"
+) -> str:
+    """Render a sweep_overlay figure wrapped in our custom Bar/Line toggle.
 
-    The figure must contain 2*n_series traces: bars (visible) followed by
-    scatter-lines (hidden). Each button rewrites the `visible` array.
+    Plotly's updatemenus buttons render with an active-state background that
+    Plotly won't let you fully style; the "active" button ends up unreadable
+    on a dark theme. So we strip the updatemenus and put a styled HTML
+    button-group on top of the chart that calls Plotly.restyle() directly.
+
+    The template (compare.html.j2 etc.) provides the matching CSS + JS handler
+    once, so each chart only needs this wrapper.
     """
-    bar_visible = [True] * n_series + [False] * n_series
-    line_visible = [False] * n_series + [True] * n_series
-    return [
-        dict(
-            type="buttons",
-            direction="right",
-            x=1.0,
-            xanchor="right",
-            y=1.16,
-            yanchor="top",
-            pad=dict(t=2, r=2, b=2, l=2),
-            showactive=True,
-            active=0,
-            bgcolor=_PANEL,
-            bordercolor=_AXIS,
-            font=dict(color=_FG, size=11, family=_FONT_FAMILY),
-            buttons=[
-                dict(label="Bar", method="update", args=[{"visible": bar_visible}]),
-                dict(label="Line", method="update", args=[{"visible": line_visible}]),
-            ],
-        )
-    ]
+    chart_html = render_figure_html(fig)
+    bar_active = "active" if initial_mode == "bar" else ""
+    line_active = "active" if initial_mode == "line" else ""
+    return (
+        f'<div class="chart-wrapper" data-nseries="{n_series}">'
+        f'  <div class="chart-toggle" role="group" aria-label="Chart type">'
+        f'    <button type="button" data-mode="bar" class="{bar_active}"'
+        f'            onclick="elbenchoToggleChart(this)">Bar</button>'
+        f'    <button type="button" data-mode="line" class="{line_active}"'
+        f'            onclick="elbenchoToggleChart(this)">Line</button>'
+        f'  </div>'
+        f'  {chart_html}'
+        f'</div>'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +361,8 @@ def sweep_overlay(
                 "%{x} • %{y:,.1f} " + hover_unit + "<extra>" + name + "</extra>"
             ).strip(),
         )
-    # Scatter+line traces second (initially hidden).
+    # Scatter+line traces second (initially hidden). Visibility flips the
+    # legend entry too, so we get one legend entry per run in either mode.
     for i, (name, ys) in enumerate(series):
         color = PALETTE[i % len(PALETTE)]
         fig.add_scatter(
@@ -376,34 +376,14 @@ def sweep_overlay(
             hovertemplate=(
                 "%{x} • %{y:,.1f} " + hover_unit + "<extra>" + name + "</extra>"
             ).strip(),
-            showlegend=False,  # legend already covered by the bar traces
         )
 
     _apply_theme(fig, title=title, x_title=x_axis_title, y_title=y_title)
-    fig.update_layout(
-        barmode="group",
-        bargap=0.25,
-        updatemenus=_toggle_buttons(n_series=n),
-    )
-    # When the user toggles, the legend needs to follow.
-    # Easiest: rebuild visibility + showlegend together via per-button args.
-    if fig.layout.updatemenus:
-        bar_visible = [True] * n + [False] * n
-        line_visible = [False] * n + [True] * n
-        bar_showleg = [True] * n + [False] * n
-        line_showleg = [False] * n + [True] * n
-        fig.layout.updatemenus[0].buttons = [
-            dict(
-                label="Bar",
-                method="update",
-                args=[{"visible": bar_visible, "showlegend": bar_showleg}],
-            ),
-            dict(
-                label="Line",
-                method="update",
-                args=[{"visible": line_visible, "showlegend": line_showleg}],
-            ),
-        ]
+    fig.update_layout(barmode="group", bargap=0.25)
+    # The Bar/Line toggle lives in HTML alongside the chart (see
+    # overlay_with_toggle) so it can be styled to match the rest of the page.
+    # The figure carries both trace types; toggle flips trace visibility via
+    # Plotly.restyle().
     return fig
 
 
