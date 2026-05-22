@@ -23,7 +23,8 @@ venv/
 *.swp
 .DS_Store
 
-# Local results from runs
-results/
-results-smoke/
+# Local results from runs (anchored to repo root so it doesn't shadow the
+# src/elbencho_harness/results/ Python module)
+/results/
+/results-smoke/
 *.log
