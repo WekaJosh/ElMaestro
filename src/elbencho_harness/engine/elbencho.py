@@ -165,6 +165,10 @@ def build_argv(
             argv += ["--s3region", tgt.region]
         if tgt.addressing == "virtual":
             argv += ["--s3virtaddr"]
+        if wl.s3_multipart_size is not None:
+            argv += ["--s3multipartsize", str(wl.s3_multipart_size)]
+        if wl.s3_object_prefix:
+            argv += ["--s3objectprefix", wl.s3_object_prefix]
         argv.append(tgt.bucket)
 
     # User escape hatch (must come last so it can override).

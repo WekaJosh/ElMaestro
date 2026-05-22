@@ -85,9 +85,12 @@ class Workload(_StrictModel):
     dataset_size: ByteSize | None = None
     file_size: ByteSize | None = None
     file_count: int | None = Field(default=None, ge=1)
+    # S3-only knobs. Ignored for POSIX targets.
+    s3_multipart_size: ByteSize | None = None
+    s3_object_prefix: str | None = None
     extra_flags: list[str] = Field(default_factory=list)
 
-    @field_validator("block_size", "dataset_size", "file_size", mode="before")
+    @field_validator("block_size", "dataset_size", "file_size", "s3_multipart_size", mode="before")
     @classmethod
     def _coerce_bytes(cls, v: Any) -> int | None:
         if v is None:

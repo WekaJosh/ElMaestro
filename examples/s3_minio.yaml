@@ -1,0 +1,35 @@
+# S3 benchmark against a MinIO endpoint. The same shape works for AWS S3 and
+# WEKA S3 — just swap the endpoint, region, and addressing style.
+#
+# Credentials must come from env: or file: — inline secrets are rejected by
+# the schema. Recommended:
+#   export MINIO_CREDS="minioadmin:minioadmin"
+#   bench run examples/s3_minio.yaml
+version: 1
+output_dir: ./results
+
+clients:
+  - host: localhost
+    elbencho_path: elbencho
+
+targets:
+  - name: minio-local
+    kind: s3
+    endpoint: http://127.0.0.1:9000
+    bucket: bench-bucket
+    region: us-east-1
+    addressing: path        # MinIO uses path-style by default
+    credentials_ref: env:MINIO_CREDS
+
+workloads:
+  - name: 4mb-put-then-get
+    pattern: seq
+    block_size: 4MiB
+    rw_mix_pct_read: 100    # 100% read (create-then-read phase pair)
+    threads_per_client: 16
+    io_depth: 4
+    file_size: 64MiB        # one object size; elbencho uses this for PUT/GET
+    file_count: 64
+    direct_io: false
+    s3_multipart_size: 8MiB
+    s3_object_prefix: elbencho-harness/
