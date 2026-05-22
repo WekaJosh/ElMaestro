@@ -12,13 +12,14 @@ from rich.table import Table
 
 from . import __version__
 from .config.loader import load_run_plan
-from .config.models import ClientHost, RunSpec
+from .config.sweep import materialize_run_refs
 from .engine.coordinator import CoordinatorError, run as run_spec
 from .report.render import render_single
 from .results.schema import Result
 from .results.store import (
     Manifest,
     new_run_dir,
+    read_manifest,
     read_result,
     spec_dir,
     write_manifest,
@@ -73,38 +74,61 @@ def run(
     config: Path = typer.Argument(..., exists=True, dir_okay=False),
     output_dir: Path = typer.Option(None, "--output-dir", "-o", help="Override output_dir from config"),
     timeout: int = typer.Option(None, "--timeout", help="Per-run subprocess timeout in seconds"),
+    resume: Path = typer.Option(
+        None,
+        "--resume",
+        help="Reuse an existing run directory; skip spec_hashes already marked completed.",
+    ),
 ) -> None:
-    """Execute the runs defined in a config and render a report for each."""
+    """Execute the runs and sweeps in a config and render a report for each spec.
+
+    Expansion order: plain `runs:` entries first (declaration order), then each
+    sweep in declaration order. A sweep expands into one spec per axis combo
+    (cartesian) or one per axis value (ladder); see docs/PLAN.md for details.
+    """
     plan = load_run_plan(config)
     base_out = Path(output_dir or plan.output_dir).resolve()
     base_out.mkdir(parents=True, exist_ok=True)
 
-    if not plan.runs:
-        err_console.print("config has no `runs:` entries (v0.1 does not yet expand sweeps)")
+    pairs = materialize_run_refs(plan)
+    if not pairs:
+        err_console.print("config has neither `runs:` nor `sweeps:` to execute")
         raise typer.Exit(code=2)
 
-    label = f"{plan.runs[0].target}_{plan.runs[0].workload}"
-    run_dir = new_run_dir(base_out, label)
-    console.print(f"[bold]Run directory:[/bold] {run_dir}")
+    # Pick a run label. Sweeps get their sweep name; plain runs use the first.
+    first_point, first_spec = pairs[0]
+    if first_point is not None:
+        label = f"sweep_{first_point.sweep_name}"
+    else:
+        label = f"{first_spec.target.name}_{first_spec.workload.name}"
 
-    manifest = Manifest(run_id=ulid.new().str, created_at=datetime.utcnow())
+    # Resume: reuse run_dir and existing manifest if --resume points at one.
+    if resume is not None:
+        run_dir = resume.resolve()
+        if not (run_dir / "manifest.json").is_file():
+            err_console.print(f"resume target has no manifest.json: {run_dir}")
+            raise typer.Exit(code=2)
+        manifest = read_manifest(run_dir)
+        console.print(f"[bold]Resuming:[/bold] {run_dir}")
+    else:
+        run_dir = new_run_dir(base_out, label)
+        manifest = Manifest(run_id=ulid.new().str, created_at=datetime.utcnow())
+        console.print(f"[bold]Run directory:[/bold] {run_dir}")
 
-    for idx, ref in enumerate(plan.runs, start=1):
-        target = plan.target_by_name(ref.target)
-        workload = plan.workload_by_name(ref.workload)
-        clients = plan.clients or [ClientHost()]
-        spec = RunSpec(
-            run_id=ulid.new().str,
-            spec_hash=RunSpec.make_spec_hash(target, workload, clients),
-            target=target,
-            workload=workload,
-            clients=clients,
-        )
-        sd = spec_dir(run_dir, idx, target.name, workload.name)
+    completed_hashes = {h for h, s in manifest.statuses.items() if s == "completed"}
+
+    for idx, (point, spec) in enumerate(pairs, start=1):
+        sweep_label = point.short_label() if point is not None else None
+        sd = spec_dir(run_dir, idx, spec.target.name, spec.workload.name, label=sweep_label)
+        header = f"[{idx:04d}] {spec.target.name} · {spec.workload.name}"
+        if sweep_label:
+            header += f" · {sweep_label}"
         console.print(
-            f"[bold cyan]→[/bold cyan] [{idx:04d}] {target.name} · {workload.name}  "
-            f"(spec_hash={spec.spec_hash[:18]}…)"
+            f"[bold cyan]→[/bold cyan] {header}  (spec_hash={spec.spec_hash[:18]}…)"
         )
+        if spec.spec_hash in completed_hashes:
+            console.print("  [dim]✓ already completed, skipping[/dim]")
+            continue
         try:
             result: Result = run_spec(spec, spec_dir=sd, timeout_s=timeout)
         except CoordinatorError as e:
@@ -124,20 +148,24 @@ def run(
             )
             manifest.statuses[spec.spec_hash] = f"failed:{result.elbencho_exit_code}"
 
+        # Update manifest after every spec so a SIGINT mid-sweep leaves resumable state.
         manifest.run_specs.append(
             {
                 "index": idx,
                 "spec_hash": spec.spec_hash,
                 "run_id": spec.run_id,
-                "target": target.name,
-                "workload": workload.name,
+                "target": spec.target.name,
+                "workload": spec.workload.name,
+                "sweep": point.sweep_name if point else None,
+                "axis_values": point.overrides if point else None,
                 "spec_dir": str(sd.relative_to(run_dir)),
             }
         )
+        write_manifest(run_dir, manifest)
 
     write_manifest(run_dir, manifest)
-    # Render a top-level pointer report that links to the first run (handy for sweeps later).
-    if manifest.statuses:
+    # Top-level pointer report links to the first completed run.
+    if manifest.run_specs:
         try:
             first_spec_dir = run_dir / manifest.run_specs[0]["spec_dir"]
             res = read_result(first_spec_dir)
@@ -145,6 +173,42 @@ def run(
         except Exception:
             pass
     console.print(f"\n[bold green]Done.[/bold green] {run_dir}")
+
+
+@app.command()
+def expand(
+    config: Path = typer.Argument(..., exists=True, dir_okay=False),
+) -> None:
+    """Dry-run: print every spec a `bench run` would execute, without running.
+
+    Useful before kicking off a long sweep, especially to verify max_runs and
+    ladder vs. cartesian counts match expectations.
+    """
+    plan = load_run_plan(config)
+    pairs = materialize_run_refs(plan)
+    if not pairs:
+        err_console.print("config has neither `runs:` nor `sweeps:`")
+        raise typer.Exit(code=2)
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("#")
+    table.add_column("source")
+    table.add_column("target")
+    table.add_column("workload")
+    table.add_column("axes")
+    table.add_column("clients")
+    for idx, (point, spec) in enumerate(pairs, start=1):
+        src = point.sweep_name if point else "runs"
+        axes = point.short_label() if point else ""
+        table.add_row(
+            f"{idx:04d}",
+            src,
+            spec.target.name,
+            spec.workload.name,
+            axes,
+            str(len(spec.clients)),
+        )
+    console.print(table)
+    console.print(f"\n[bold]{len(pairs)}[/bold] spec(s) total.")
 
 
 @app.command()

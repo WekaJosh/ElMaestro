@@ -1,0 +1,36 @@
+# Block-size sweep against a local mount. Useful for finding the sweet-spot
+# block size for sequential reads against a given filesystem.
+#
+# Cartesian over {block_size} only yields N points; this expands to 5.
+version: 1
+output_dir: ./results
+
+clients:
+  - host: localhost
+    elbencho_path: elbencho
+
+targets:
+  - name: local-tmp
+    kind: posix
+    mount_path: /tmp
+    dataset_subdir: elbencho-harness-bench
+    cleanup: false
+
+workloads:
+  - name: seq-read-base
+    pattern: seq
+    block_size: 1MiB  # overridden by the sweep
+    rw_mix_pct_read: 100
+    threads_per_client: 4
+    io_depth: 4
+    file_size: 256MiB
+    file_count: 4
+    direct_io: false
+
+sweeps:
+  - name: bs-scan
+    base: seq-read-base
+    target: local-tmp
+    order: cartesian
+    axes:
+      block_size: [64KiB, 256KiB, 1MiB, 4MiB, 16MiB]
