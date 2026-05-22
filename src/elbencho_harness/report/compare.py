@@ -21,7 +21,13 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from ..results.schema import PhaseResult, Result
 from ..results.store import list_results, read_manifest
-from .charts import render_figure_html
+from .charts import (
+    axis_pretty_name,
+    detect_common_axis,
+    format_axis_value,
+    render_figure_html,
+    sweep_overlay,
+)
 from .render import TEMPLATES_DIR
 
 import plotly.graph_objects as go
@@ -70,7 +76,7 @@ def load_run(run_dir: Path, *, label: str | None = None) -> LoadedRun:
                 continue
             paired.append(ResultWithAxes(result=result, axes=entry.get("axis_values")))
     else:
-        # No manifest — fall back to listing result.json files in directory order.
+        # No manifest, fall back to listing result.json files in directory order.
         for r in list_results(rdir):
             paired.append(ResultWithAxes(result=r, axes=None))
     return LoadedRun(label=label or rdir.name, run_dir=rdir, results=paired)
@@ -118,7 +124,8 @@ class CompareRow:
     spec_key: tuple
     target: str
     workload: str
-    axis_label: str
+    axis_label: str          # composite human label, e.g. "block_size=64KiB"
+    axes: dict[str, Any] | None  # raw axis-values dict from the manifest
     per_run: dict[str, dict[str, float | None]]  # run_label -> {metric: value}
 
     def baseline_value(self, metric: str, baseline_label: str) -> float | None:
@@ -146,6 +153,7 @@ def build_rows(runs: list[LoadedRun]) -> list[CompareRow]:
                     target=r.target.name,
                     workload=r.workload.name,
                     axis_label=_format_axes(rwa.axes),
+                    axes=rwa.axes,
                     per_run={},
                 )
                 keyed[key] = row
@@ -155,10 +163,28 @@ def build_rows(runs: list[LoadedRun]) -> list[CompareRow]:
                 "avg_lat_us": _avg_lat_of(r),
                 "duration_s": r.duration_s,
             }
-    # Stable order: target, workload, axis_label.
+    # Stable order: target, workload, then by the *numeric* axis value if one is
+    # shared (so the chart x-axis sorts naturally for sweeps), else by label.
+    common_axis = detect_common_axis([r.axes for r in keyed.values()])
+    if common_axis is not None:
+        return sorted(
+            keyed.values(),
+            key=lambda r: (r.target, r.workload, _numeric_axis_value(r.axes, common_axis)),
+        )
     return sorted(
         keyed.values(), key=lambda r: (r.target, r.workload, r.axis_label)
     )
+
+
+def _numeric_axis_value(axes: dict[str, Any] | None, axis: str) -> float:
+    """Pull the sweep axis value as a number for sorting. Strings sort last."""
+    if not axes:
+        return float("inf")
+    v = axes.get(axis)
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float("inf")
 
 
 def _format_axes(axes: dict[str, Any] | None) -> str:
@@ -173,66 +199,76 @@ def _format_axes(axes: dict[str, Any] | None) -> str:
 # --- charts -----------------------------------------------------------------
 
 
+def _chart_axis(rows: list[CompareRow]) -> tuple[list[str], str]:
+    """Return (x_labels, x_axis_title) for a chart.
+
+    When every row's axes dict has the same single axis (a clean 1-D sweep),
+    use the axis value alone as the tick label ("64k", "4m", "16"). Otherwise
+    fall back to the composite per-row label ("target·workload·axes").
+    """
+    common = detect_common_axis([r.axes for r in rows])
+    if common is not None:
+        x_labels = [format_axis_value(common, r.axes[common]) for r in rows]
+        return x_labels, axis_pretty_name(common)
+    # Multi-axis fallback: compose target + axes if any.
+    fallback: list[str] = []
+    for r in rows:
+        s = f"{r.target}·{r.workload}"
+        if r.axis_label:
+            s += f"·{r.axis_label}"
+        fallback.append(s)
+    return fallback, ""
+
+
+def _series_from_rows(
+    runs: list[LoadedRun], rows: list[CompareRow], metric: str
+) -> list[tuple[str, list[float | None]]]:
+    return [
+        (run.label, [r.per_run.get(run.label, {}).get(metric) for r in rows])
+        for run in runs
+    ]
+
+
 def throughput_overlay(runs: list[LoadedRun]) -> go.Figure:
-    """Grouped-bar overlay: one bar per (spec, run) showing throughput MiB/s."""
+    """Throughput overlay with live Bar/Line toggle."""
     rows = build_rows(runs)
-    x_labels = [_short_x(r) for r in rows]
-    fig = go.Figure()
-    for run in runs:
-        ys = [r.per_run.get(run.label, {}).get("throughput_mib_s") or 0 for r in rows]
-        fig.add_bar(name=run.label, x=x_labels, y=ys)
-    fig.update_layout(
-        title="Throughput by spec",
-        yaxis_title="MiB/s",
-        barmode="group",
-        template="plotly_white",
-        height=460,
-        xaxis_tickangle=-30,
+    x_labels, x_title = _chart_axis(rows)
+    return sweep_overlay(
+        title="Throughput",
+        x_labels=x_labels,
+        x_axis_title=x_title,
+        y_title="MiB/s",
+        series=_series_from_rows(runs, rows, "throughput_mib_s"),
+        hover_unit="MiB/s",
     )
-    return fig
 
 
 def iops_overlay(runs: list[LoadedRun]) -> go.Figure:
+    """IOPS overlay with live Bar/Line toggle."""
     rows = build_rows(runs)
-    x_labels = [_short_x(r) for r in rows]
-    fig = go.Figure()
-    for run in runs:
-        ys = [r.per_run.get(run.label, {}).get("iops") or 0 for r in rows]
-        fig.add_bar(name=run.label, x=x_labels, y=ys)
-    fig.update_layout(
-        title="IOPS by spec",
-        yaxis_title="IOPS",
-        barmode="group",
-        template="plotly_white",
-        height=460,
-        xaxis_tickangle=-30,
+    x_labels, x_title = _chart_axis(rows)
+    return sweep_overlay(
+        title="IOPS",
+        x_labels=x_labels,
+        x_axis_title=x_title,
+        y_title="IOPS",
+        series=_series_from_rows(runs, rows, "iops"),
+        hover_unit="IOPS",
     )
-    return fig
 
 
 def latency_overlay(runs: list[LoadedRun]) -> go.Figure:
+    """Average IO latency overlay with live Bar/Line toggle."""
     rows = build_rows(runs)
-    x_labels = [_short_x(r) for r in rows]
-    fig = go.Figure()
-    for run in runs:
-        ys = [r.per_run.get(run.label, {}).get("avg_lat_us") or 0 for r in rows]
-        fig.add_bar(name=run.label, x=x_labels, y=ys)
-    fig.update_layout(
-        title="Avg IO latency by spec",
-        yaxis_title="µs",
-        barmode="group",
-        template="plotly_white",
-        height=460,
-        xaxis_tickangle=-30,
+    x_labels, x_title = _chart_axis(rows)
+    return sweep_overlay(
+        title="Average IO latency",
+        x_labels=x_labels,
+        x_axis_title=x_title,
+        y_title="µs",
+        series=_series_from_rows(runs, rows, "avg_lat_us"),
+        hover_unit="µs",
     )
-    return fig
-
-
-def _short_x(row: CompareRow) -> str:
-    s = f"{row.target}·{row.workload}"
-    if row.axis_label:
-        s += f"·{row.axis_label}"
-    return s
 
 
 # --- rendering --------------------------------------------------------------
