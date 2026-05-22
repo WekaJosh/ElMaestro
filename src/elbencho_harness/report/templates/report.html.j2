@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>elbencho-harness · {{ run_label }}</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #161b22;
+    --border: #2d333b;
+    --fg: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --good: #3fb950;
+    --warn: #d29922;
+    --bad: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    background: var(--bg); color: var(--fg);
+  }
+  header {
+    padding: 24px 32px;
+    border-bottom: 1px solid var(--border);
+    background: linear-gradient(180deg, #161b22 0%, #0e1116 100%);
+  }
+  header h1 { margin: 0; font-size: 20px; letter-spacing: -0.01em; }
+  header .sub { color: var(--muted); margin-top: 4px; font-size: 13px; }
+  main { padding: 24px 32px; max-width: 1320px; margin: 0 auto; }
+  section { margin-bottom: 32px; }
+  section h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 12px; }
+  .tiles {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 12px;
+  }
+  .tile {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .tile .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .tile .value { font-size: 24px; font-weight: 600; margin-top: 6px; letter-spacing: -0.01em; }
+  .tile .unit { color: var(--muted); font-size: 13px; margin-left: 4px; font-weight: 400; }
+  .tile.subtle .value { color: var(--muted); font-weight: 500; }
+  .chart {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  table.meta {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  table.meta th, table.meta td {
+    text-align: left;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  table.meta th { color: var(--muted); font-weight: 500; width: 220px; }
+  table.meta tr:last-child td, table.meta tr:last-child th { border-bottom: none; }
+  code { color: var(--accent); background: #0b0e13; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  footer { padding: 24px 32px; color: var(--muted); font-size: 12px; border-top: 1px solid var(--border); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>{{ run_label }}</h1>
+  <div class="sub">
+    {{ result.target.kind }} target <strong>{{ result.target.name }}</strong>
+    · workload <strong>{{ result.workload.name }}</strong>
+    · primary phase <strong>{{ result.primary_phase }}</strong>
+    · {{ result.started_at }}
+  </div>
+</header>
+
+<main>
+
+<section>
+  <h2>Headline</h2>
+  <div class="tiles">
+    {% for t in tiles %}
+      <div class="tile {% if t.subtle %}subtle{% endif %}">
+        <div class="label">{{ t.label }}</div>
+        <div class="value">
+          {% if t.value is none %}—{% else %}{{ ("{:" ~ t.fmt ~ "}").format(t.value) }}{% endif %}
+          {% if t.unit %}<span class="unit">{{ t.unit }}</span>{% endif %}
+        </div>
+      </div>
+    {% endfor %}
+  </div>
+</section>
+
+<section>
+  <h2>Throughput</h2>
+  <div class="chart">{{ throughput_html | safe }}</div>
+</section>
+
+{% if latency_html %}
+<section>
+  <h2>Latency</h2>
+  <div class="chart">{{ latency_html | safe }}</div>
+</section>
+{% endif %}
+
+<section>
+  <h2>Run details</h2>
+  <table class="meta">
+    <tr><th>run_id</th><td><code>{{ result.run_id }}</code></td></tr>
+    <tr><th>spec_hash</th><td><code>{{ result.spec_hash }}</code></td></tr>
+    <tr><th>schema_version</th><td>{{ result.schema_version }}</td></tr>
+    <tr><th>started_at</th><td>{{ result.started_at }}</td></tr>
+    <tr><th>finished_at</th><td>{{ result.finished_at }}</td></tr>
+    <tr><th>duration_s</th><td>{{ "%.2f"|format(result.duration_s) }}</td></tr>
+    <tr><th>elbencho_exit_code</th><td>{{ result.elbencho_exit_code }}</td></tr>
+    <tr><th>block_size</th><td>{{ result.workload.block_size }} bytes</td></tr>
+    <tr><th>threads_per_client</th><td>{{ result.workload.threads_per_client }}</td></tr>
+    <tr><th>io_depth</th><td>{{ result.workload.io_depth }}</td></tr>
+    <tr><th>pattern</th><td>{{ result.workload.pattern }}</td></tr>
+    <tr><th>rw_mix_pct_read</th><td>{{ result.workload.rw_mix_pct_read }}</td></tr>
+    <tr><th>direct_io</th><td>{{ result.workload.direct_io }}</td></tr>
+    <tr><th>total_concurrency</th><td>{{ result.workload.total_concurrency }}</td></tr>
+    <tr><th>elbencho version</th><td>{{ result.clients[0].elbencho_version or "unknown" }} ({{ result.clients[0].features|join(", ") or "no features" }})</td></tr>
+    <tr><th>command</th><td><code>{{ result.elbencho.command }}</code></td></tr>
+  </table>
+</section>
+
+{% if result.errors %}
+<section>
+  <h2>Errors</h2>
+  <div class="chart">
+    <pre style="color: var(--bad); white-space: pre-wrap; margin: 0;">{{ result.errors | join("\n") }}</pre>
+  </div>
+</section>
+{% endif %}
+
+</main>
+
+<footer>
+  Generated by elbencho-harness · result file: <code>result.json</code> · raw artifacts: <code>raw/</code>
+</footer>
+
+</body>
+</html>

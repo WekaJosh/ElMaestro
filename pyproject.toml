@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "elbencho-harness"
+version = "0.1.0"
+description = "Interactive IO benchmarking harness built on elbencho"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Josh Hampton" }]
+dependencies = [
+    "pydantic>=2.7,<3",
+    "pyyaml>=6.0,<7",
+    "typer>=0.12,<1",
+    "rich>=13",
+    "plotly>=5.20,<6",
+    "jinja2>=3.1,<4",
+    "humanfriendly>=10",
+    "ulid-py>=1.1",
+    "structlog>=24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio",
+    "ruff",
+    "mypy",
+    "types-PyYAML",
+]
+# Reserved for later phases:
+# tui = ["textual>=0.80,<1.0", "textual-plotext>=0.4"]
+# ssh = ["asyncssh>=2.14,<3"]
+# data = ["pandas>=2.2,<3"]
+
+[project.scripts]
+bench = "elbencho_harness.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/elbencho_harness"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "W"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+ignore_missing_imports = true
