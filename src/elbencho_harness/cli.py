@@ -14,6 +14,7 @@ from . import __version__
 from .config.loader import load_run_plan
 from .config.sweep import materialize_run_refs
 from .engine.coordinator import CoordinatorError, run as run_spec
+from .report.compare import load_run, render_compare
 from .report.render import render_single
 from .results.schema import Result
 from .results.store import (
@@ -231,6 +232,53 @@ def report(
         err_console.print(f"no result.json files found under {results_dir}")
         raise typer.Exit(code=1)
     console.print(f"[bold green]Rendered[/bold green] {len(rendered)} report(s).")
+
+
+@app.command()
+def compare(
+    run_dirs: list[Path] = typer.Argument(..., exists=True, file_okay=False),
+    out: Path = typer.Option(
+        Path("./compare.html"), "--out", "-o", help="Output HTML path"
+    ),
+    baseline: str = typer.Option(
+        None,
+        "--baseline",
+        help="Label of the baseline run (default: first arg). Deltas are vs this run.",
+    ),
+    label: list[str] = typer.Option(
+        None,
+        "--label",
+        help="Override run label(s). Pass once per run_dir, in order. "
+        "Default: directory basename.",
+    ),
+    title: str = typer.Option(
+        "elbencho-harness compare", "--title", help="Title shown in the report header"
+    ),
+) -> None:
+    """Overlay N run directories into one comparison HTML report.
+
+    Each positional argument is a run directory (the kind `bench run` produces).
+    Specs are aligned across runs by (target, workload, sweep-axis-values). The
+    diff table shows percentage change vs the baseline.
+    """
+    labels = list(label or [])
+    if labels and len(labels) != len(run_dirs):
+        err_console.print(
+            f"--label count ({len(labels)}) must match run_dirs count ({len(run_dirs)})"
+        )
+        raise typer.Exit(code=2)
+    loaded = [
+        load_run(d, label=labels[i] if i < len(labels) else None)
+        for i, d in enumerate(run_dirs)
+    ]
+    if any(len(lr.results) == 0 for lr in loaded):
+        empties = [lr.label for lr in loaded if len(lr.results) == 0]
+        err_console.print(
+            f"these run directories have no parseable result.json files: {empties}"
+        )
+        raise typer.Exit(code=2)
+    out_path = render_compare(loaded, out.resolve(), baseline_label=baseline, title=title)
+    console.print(f"[bold green]Wrote[/bold green] {out_path}")
 
 
 def main() -> None:
