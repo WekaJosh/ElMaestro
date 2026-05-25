@@ -32,12 +32,10 @@ dev = [
 ]
 ssh = ["asyncssh>=2.14,<3"]
 tui = ["textual>=0.80,<1.0", "textual-plotext>=0.4"]
-data = ["pandas>=2.2,<3"]
 all = [
     "asyncssh>=2.14,<3",
     "textual>=0.80,<1.0",
     "textual-plotext>=0.4",
-    "pandas>=2.2,<3",
 ]
 
 [project.scripts]

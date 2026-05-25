@@ -58,8 +58,11 @@ a = Analysis(  # noqa: F821
     hiddenimports=hidden_imports,
     hookspath=[],
     runtime_hooks=[],
+    # Strip docstrings + assertions from bundled bytecode (equivalent to
+    # python -O / -OO). Saves a few percent of the PYZ.
+    optimize=2,
     excludes=[
-        # Lighten the bundle. We don't ship dev tooling.
+        # Dev tooling.
         "pytest",
         "ruff",
         "mypy",
@@ -67,6 +70,20 @@ a = Analysis(  # noqa: F821
         "jupyter",
         "matplotlib",
         "tkinter",
+        # Plotly's optional DataFrame inputs. We only build figures
+        # programmatically and render to HTML; never pass pandas/numpy in.
+        # Without these excludes plotly's import hooks pull pandas (~20 MB
+        # in the bundle) and numpy (~7 MB).
+        "pandas",
+        "numpy",
+        "pytz",
+        "tzdata",
+        # PyInstaller picks up jupyter / jupyterlab notebook stuff when
+        # plotly is available; we never render to a Jupyter widget.
+        "jupyterlab_plotly",
+        "ipykernel",
+        "ipython_genutils",
+        "notebook",
     ],
     noarchive=False,
 )
@@ -83,7 +100,10 @@ exe = EXE(  # noqa: F821
     name="elmaestro",
     debug=False,
     bootloader_ignore_signals=False,
-    strip=False,
+    # Strip symbol tables from shipped native libs. ~5% savings, breaks
+    # stack traces from C extensions but those aren't useful to end users
+    # of the binary anyway.
+    strip=True,
     upx=False,         # UPX can break macOS code signing; leave off
     upx_exclude=[],
     runtime_tmpdir=None,
