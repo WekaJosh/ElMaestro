@@ -15,6 +15,14 @@ __pycache__/
 /build/
 /dist/
 
+# Rust
+/target/
+/Cargo.lock.bak
+
+# Python build artifacts under python-legacy/
+/python-legacy/build/
+/python-legacy/dist/
+
 # Virtualenv / uv
 .venv/
 venv/
