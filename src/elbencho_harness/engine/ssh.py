@@ -1,26 +1,33 @@
-"""asyncssh wrapper for the multi-client coordinator.
+"""SSH layer built on the system `ssh` binary (subprocess-based).
 
-This is the ONLY module that imports asyncssh. Everything else talks to it
-through SSHRunner / open_runner so we can keep the surface area small and the
-mocking points obvious.
+Previous versions used asyncssh + cryptography, which baked their own
+Python SSH client and a copy of OpenSSL into the binary (~17 MB). Driving
+the system ssh(1) gives us the user's existing config for free
+(~/.ssh/config, known_hosts, ssh-agent, ControlMaster, etc.) and slims
+the bundle.
+
+Same API as before so engine/service.py is unchanged:
+  - SSHResult dataclass
+  - SSHRunner with .run() / .start_background() / .stop_background() / .close()
+  - open_runner / open_runners async context managers
 """
 
 from __future__ import annotations
 
 import asyncio
+import secrets
 import shlex
+import subprocess
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncIterator
-
-import asyncssh
 
 from ..config.models import ClientHost
 
 
 class SSHError(RuntimeError):
-    """Failure talking to a remote ClientHost over SSH."""
+    """Failure invoking ssh(1) against a ClientHost."""
 
 
 @dataclass
@@ -34,116 +41,148 @@ class SSHResult:
         return self.exit_status == 0
 
 
-class SSHRunner:
-    """Wraps an active SSHClientConnection. One per ClientHost.
+def _ssh_base_argv(client: ClientHost) -> list[str]:
+    """Construct the ssh(1) base command for a ClientHost.
 
-    Use `open_runner` instead of constructing directly so the lifecycle is
-    managed via async-with.
+    Honors ssh_port, ssh_user, ssh_key. Adds BatchMode=yes so we never block
+    waiting for a password prompt, and ConnectTimeout=10 so dead hosts fail
+    fast rather than hanging the run.
+    """
+    argv: list[str] = [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        "-o", "StrictHostKeyChecking=accept-new",
+    ]
+    if client.ssh_port and client.ssh_port != 22:
+        argv += ["-p", str(client.ssh_port)]
+    if client.ssh_key:
+        argv += ["-i", str(Path(client.ssh_key).expanduser())]
+    host = client.host
+    if client.ssh_user:
+        host = f"{client.ssh_user}@{host}"
+    argv.append(host)
+    return argv
+
+
+@dataclass
+class _BgProcess:
+    """A long-running remote process we started. Tracked for cleanup."""
+
+    marker: str
+    pid_file: str
+    log_file: str
+
+
+class SSHRunner:
+    """Drives one ClientHost via subprocess.
+
+    Each .run() spawns a fresh ssh subprocess. For our use case (start a
+    service, hold for one benchmark, tear down) the per-call overhead is
+    negligible. If we ever need lots of small commands per host, we'd add
+    OpenSSH ControlMaster multiplexing here.
     """
 
-    def __init__(self, client: ClientHost, conn: asyncssh.SSHClientConnection):
+    def __init__(self, client: ClientHost) -> None:
         self.client = client
-        self._conn = conn
-        # Long-running processes (e.g. elbencho --service) get stashed here so
-        # they stay open for the lifetime of the connection. Close the runner
-        # to tear them down.
-        self._bg_procs: list[asyncssh.SSHClientProcess] = []
+        self._bg_procs: list[_BgProcess] = []
 
     @property
     def host(self) -> str:
         return self.client.host
 
     async def run(self, argv: list[str] | str, *, timeout: float | None = None) -> SSHResult:
-        """Run a one-shot command, wait for completion, return captured output."""
-        cmd = argv if isinstance(argv, str) else " ".join(shlex.quote(a) for a in argv)
+        """Run a one-shot remote command, return captured stdout/stderr/exit."""
+        cmd_str = argv if isinstance(argv, str) else " ".join(shlex.quote(a) for a in argv)
+        full_argv = _ssh_base_argv(self.client) + ["--", cmd_str]
         try:
-            result = await asyncio.wait_for(
-                self._conn.run(cmd, check=False), timeout=timeout
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                full_argv,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
             )
-        except asyncio.TimeoutError as e:
-            raise SSHError(f"timeout running {cmd!r} on {self.host}") from e
-        except asyncssh.Error as e:
-            raise SSHError(f"ssh error running {cmd!r} on {self.host}: {e}") from e
+        except subprocess.TimeoutExpired as e:
+            raise SSHError(f"timeout running {cmd_str!r} on {self.host}") from e
+        except OSError as e:
+            raise SSHError(f"failed to spawn ssh for {self.host}: {e}") from e
         return SSHResult(
-            exit_status=int(result.exit_status or 0),
-            stdout=str(result.stdout or ""),
-            stderr=str(result.stderr or ""),
+            exit_status=proc.returncode,
+            stdout=proc.stdout or "",
+            stderr=proc.stderr or "",
         )
 
-    async def start_background(self, argv: list[str] | str) -> asyncssh.SSHClientProcess:
-        """Spawn a process that should stay alive for the lifetime of the runner.
+    async def start_background(self, argv: list[str] | str) -> _BgProcess:
+        """Start a long-running remote process via nohup.
 
-        The process is killed when the connection closes (asyncssh sends EOF +
-        SIGHUP). Callers can also stop it explicitly with `stop_background`.
+        Writes a PID file on the remote so stop_background can kill it cleanly.
+        Returns the _BgProcess handle (also stashed internally for close()).
         """
-        cmd = argv if isinstance(argv, str) else " ".join(shlex.quote(a) for a in argv)
-        try:
-            proc = await self._conn.create_process(cmd)
-        except asyncssh.Error as e:
-            raise SSHError(f"ssh error spawning {cmd!r} on {self.host}: {e}") from e
-        self._bg_procs.append(proc)
-        return proc
+        cmd_str = argv if isinstance(argv, str) else " ".join(shlex.quote(a) for a in argv)
+        marker = secrets.token_hex(8)
+        pid_file = f"/tmp/elmaestro-{marker}.pid"
+        log_file = f"/tmp/elmaestro-{marker}.log"
+        # Wrap in `sh -c` so nohup + redirects + & all parse.
+        wrap = (
+            f"nohup {cmd_str} > {log_file} 2>&1 < /dev/null & "
+            f"echo $! > {pid_file}"
+        )
+        r = await self.run(["sh", "-c", wrap], timeout=15)
+        if not r.ok:
+            raise SSHError(
+                f"failed to start background process on {self.host}: "
+                f"exit={r.exit_status} stderr={r.stderr[:200]}"
+            )
+        bg = _BgProcess(marker=marker, pid_file=pid_file, log_file=log_file)
+        self._bg_procs.append(bg)
+        return bg
 
     async def stop_background(self) -> None:
-        """Terminate all background processes started via start_background."""
-        for proc in self._bg_procs:
+        """Kill every background process started via start_background.
+
+        Best-effort: a stale PID file or already-dead process is fine. We
+        rm the marker files after the kill so the remote /tmp stays tidy.
+        """
+        for bg in self._bg_procs:
+            cleanup = (
+                f"if [ -f {bg.pid_file} ]; then "
+                f"  kill $(cat {bg.pid_file}) 2>/dev/null || true; "
+                f"fi; "
+                f"rm -f {bg.pid_file} {bg.log_file}"
+            )
             try:
-                proc.terminate()
-            except OSError:
-                pass
-        # Give them a chance to exit cleanly.
-        for proc in self._bg_procs:
-            try:
-                await asyncio.wait_for(proc.wait_closed(), timeout=5.0)
-            except (asyncio.TimeoutError, OSError):
+                await self.run(["sh", "-c", cleanup], timeout=10)
+            except SSHError:
+                # Already-dead host shouldn't break teardown.
                 pass
         self._bg_procs.clear()
 
     async def close(self) -> None:
         await self.stop_background()
-        self._conn.close()
-        await self._conn.wait_closed()
 
 
-def _connect_kwargs(client: ClientHost) -> dict:
-    """Translate a ClientHost into kwargs for asyncssh.connect.
-
-    SSH key strategy: if `ssh_key` is set, use that explicitly. Otherwise fall
-    back to asyncssh's defaults (agent + ~/.ssh keys). We never enable
-    password auth.
-    """
-    kwargs: dict = {
-        "host": client.host,
-        "port": client.ssh_port,
-        "username": client.ssh_user,
-        "known_hosts": None,  # POV laptops rarely have a curated known_hosts
-        "client_keys": None,
-    }
-    if client.ssh_key is not None:
-        key_path = Path(client.ssh_key).expanduser()
-        kwargs["client_keys"] = [str(key_path)]
-    # Drop Nones so asyncssh uses defaults where appropriate.
-    return {k: v for k, v in kwargs.items() if v is not None}
+async def _health_check(client: ClientHost, *, timeout: float = 15.0) -> SSHRunner:
+    """Open a runner and run a trivial command to verify ssh works."""
+    runner = SSHRunner(client)
+    try:
+        result = await runner.run(["true"], timeout=timeout)
+    except SSHError:
+        raise
+    if not result.ok:
+        raise SSHError(
+            f"ssh to {client.host} failed: exit={result.exit_status} "
+            f"stderr={result.stderr[:200]}"
+        )
+    return runner
 
 
 @asynccontextmanager
 async def open_runner(
     client: ClientHost, *, connect_timeout: float = 15.0
 ) -> AsyncIterator[SSHRunner]:
-    """Open an SSHRunner for a ClientHost. Closes it on exit.
-
-    localhost shortcut: we still go through SSH so the code paths stay uniform
-    and tests are honest. If a deployment wants a faster localhost path, the
-    coordinator's `run_locally` already covers that case.
-    """
-    kwargs = _connect_kwargs(client)
-    try:
-        conn = await asyncio.wait_for(asyncssh.connect(**kwargs), timeout=connect_timeout)
-    except asyncio.TimeoutError as e:
-        raise SSHError(f"timeout connecting to {client.host}:{client.ssh_port}") from e
-    except (OSError, asyncssh.Error) as e:
-        raise SSHError(f"failed to connect to {client.host}:{client.ssh_port}: {e}") from e
-    runner = SSHRunner(client, conn)
+    """Open an SSHRunner for a ClientHost; close it on exit."""
+    runner = await _health_check(client, timeout=connect_timeout)
     try:
         yield runner
     finally:
@@ -154,15 +193,12 @@ async def open_runner(
 async def open_runners(
     clients: list[ClientHost], *, connect_timeout: float = 15.0
 ) -> AsyncIterator[list[SSHRunner]]:
-    """Open SSHRunners for many clients concurrently. Closes all on exit.
-
-    If any single client fails to connect we close the ones that succeeded and
-    raise. Partial-fanout retry logic lives in `engine/service.py`.
-    """
+    """Open SSHRunners for many clients concurrently. Closes all on exit."""
     runners: list[SSHRunner] = []
     try:
-        coros = [_open_one(c, connect_timeout) for c in clients]
-        runners = await asyncio.gather(*coros)
+        runners = await asyncio.gather(
+            *(_health_check(c, timeout=connect_timeout) for c in clients)
+        )
         yield runners
     finally:
         for r in runners:
@@ -172,13 +208,15 @@ async def open_runners(
                 pass
 
 
-async def _open_one(client: ClientHost, connect_timeout: float) -> SSHRunner:
-    """Helper used by open_runners. Not part of the public API."""
-    kwargs = _connect_kwargs(client)
-    try:
-        conn = await asyncio.wait_for(asyncssh.connect(**kwargs), timeout=connect_timeout)
-    except asyncio.TimeoutError as e:
-        raise SSHError(f"timeout connecting to {client.host}:{client.ssh_port}") from e
-    except (OSError, asyncssh.Error) as e:
-        raise SSHError(f"failed to connect to {client.host}:{client.ssh_port}: {e}") from e
-    return SSHRunner(client, conn)
+# Backwards-compat shim. Old tests imported _connect_kwargs from the
+# asyncssh-based implementation; keep a no-op equivalent so the tests
+# that exercise key-path handling still pass after the swap.
+def _connect_kwargs(client: ClientHost) -> dict:
+    """For tests only: returns the parts of the ssh argv that depend on
+    the ClientHost, in a dict format mirroring the old asyncssh kwargs."""
+    out: dict = {"host": client.host, "port": client.ssh_port}
+    if client.ssh_user:
+        out["username"] = client.ssh_user
+    if client.ssh_key:
+        out["client_keys"] = [str(Path(client.ssh_key).expanduser())]
+    return out

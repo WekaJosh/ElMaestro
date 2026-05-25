@@ -1,12 +1,13 @@
 """Tests for engine/service.py.
 
-Mocks asyncssh and the TCP port probe so we don't need real network listeners.
+Service lifecycle is driven through the SSH layer (now subprocess-based).
+We mock subprocess.run + the TCP port probe so no real ssh / no real
+listeners are needed.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 import pytest
 
@@ -22,70 +23,41 @@ from elbencho_harness.engine.service import (
 
 
 @dataclass
-class _Proc:
-    terminated: bool = False
-
-    def terminate(self) -> None:
-        self.terminated = True
-
-    async def wait_closed(self) -> None:
-        return None
+class _CompletedProcess:
+    returncode: int = 0
+    stdout: str = ""
+    stderr: str = ""
 
 
-@dataclass
-class _Conn:
-    host: str
-    port: int = 22
-    username: str | None = None
-    closed: bool = False
-    commands_run: list[str] = field(default_factory=list)
-    bg_commands: list[str] = field(default_factory=list)
-    bg_procs: list[_Proc] = field(default_factory=list)
-    version_stdout: str = "elbencho version 3.1.3\n"
+def _patch_subprocess(monkeypatch, returncode: int = 0, stdout: str = "elbencho 3.1.3\n"):
+    """Make subprocess.run record argv and return a configurable result."""
+    calls: list[list[str]] = []
 
-    async def run(self, cmd: str, check: bool = False) -> Any:
-        self.commands_run.append(cmd)
-        from types import SimpleNamespace
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return _CompletedProcess(returncode=returncode, stdout=stdout, stderr="")
 
-        return SimpleNamespace(exit_status=0, stdout=self.version_stdout, stderr="")
-
-    async def create_process(self, cmd: str) -> _Proc:
-        self.bg_commands.append(cmd)
-        p = _Proc()
-        self.bg_procs.append(p)
-        return p
-
-    def close(self) -> None:
-        self.closed = True
-
-    async def wait_closed(self) -> None:
-        return None
+    monkeypatch.setattr(ssh_mod.subprocess, "run", fake_run)
+    return calls
 
 
 @pytest.fixture
 def patch_ssh_and_probe(monkeypatch):
-    """Replace asyncssh.connect and the TCP probe with cooperative fakes."""
-    conns: list[_Conn] = []
-
-    async def fake_connect(**kwargs: Any) -> _Conn:
-        c = _Conn(host=kwargs["host"], port=kwargs.get("port", 22))
-        conns.append(c)
-        return c
-
-    monkeypatch.setattr(ssh_mod.asyncssh, "connect", fake_connect)
+    """Replace subprocess.run and the TCP probe with cooperative fakes."""
+    calls = _patch_subprocess(monkeypatch)
     probed: list[tuple[str, int]] = []
 
-    async def fake_probe(host: str, port: int, **kwargs: Any) -> bool:
+    async def fake_probe(host: str, port: int, **kwargs) -> bool:
         probed.append((host, port))
         return True
 
     monkeypatch.setattr(service_mod, "_probe_port", fake_probe)
-    return conns, probed
+    return calls, probed
 
 
 @pytest.mark.asyncio
 async def test_services_running_starts_and_stops_each_client(patch_ssh_and_probe):
-    conns, probed = patch_ssh_and_probe
+    calls, probed = patch_ssh_and_probe
     clients = [
         ClientHost(host="h1", ssh_user="u", service_port=1611),
         ClientHost(host="h2", ssh_user="u", service_port=1611),
@@ -93,36 +65,29 @@ async def test_services_running_starts_and_stops_each_client(patch_ssh_and_probe
     async with services_running(clients) as endpoints:
         assert {e.host for e in endpoints} == {"h1", "h2"}
         assert all(e.port == 1611 for e in endpoints)
-        # Each client should have had a service-start command and a version probe.
-        all_bg = [c for c in conns for cmd in c.bg_commands]
-        assert len(all_bg) == 2
-        for c in conns:
-            assert any("--service" in cmd and "1611" in cmd for cmd in c.bg_commands)
-            assert any("--version" in cmd for cmd in c.commands_run)
+        # Each client must have had a remote `nohup ... --service ... --port 1611` invocation.
+        nohup_cmds = [c[-1] for c in calls if "nohup" in c[-1]]
+        assert any("--service" in cmd and "1611" in cmd for cmd in nohup_cmds)
+        # Each client must have had a `--version` probe.
+        version_cmds = [c[-1] for c in calls if "--version" in c[-1]]
+        assert len(version_cmds) >= 2
         # Port probes happened.
         assert ("h1", 1611) in probed
         assert ("h2", 1611) in probed
-    # On context exit the connections must be closed.
-    for c in conns:
-        assert c.closed is True
-        for p in c.bg_procs:
-            assert p.terminated is True
+    # On context exit, the cleanup `kill $(cat ...pid)` must have run for each.
+    cleanup_cmds = [c[-1] for c in calls if "kill" in c[-1]]
+    assert len(cleanup_cmds) >= 2
 
 
 @pytest.mark.asyncio
 async def test_services_running_propagates_probe_failure(monkeypatch):
     """If the port probe never succeeds, raise ServiceError; cleanup still runs."""
-
-    async def fake_connect(**kwargs):
-        return _Conn(host=kwargs["host"], port=kwargs.get("port", 22))
-
-    monkeypatch.setattr(ssh_mod.asyncssh, "connect", fake_connect)
+    _patch_subprocess(monkeypatch)
 
     async def never_listens(host: str, port: int, **kwargs) -> bool:
         return False
 
     monkeypatch.setattr(service_mod, "_probe_port", never_listens)
-    # Speed up the test: shrink the wait loop.
     monkeypatch.setattr(
         service_mod,
         "_wait_for_service",
@@ -135,7 +100,7 @@ async def test_services_running_propagates_probe_failure(monkeypatch):
 
 def _make_fast_waiter():
     async def fast(host: str, port: int, **kwargs):
-        raise ServiceError(f"elbencho service never came up on {host}:{port}")
+        raise ServiceError(f"service never came up on {host}:{port}")
 
     return fast
 

@@ -30,10 +30,11 @@ dev = [
     "mypy",
     "types-PyYAML",
 ]
-ssh = ["asyncssh>=2.14,<3"]
+# Note: there's no `ssh` extra. Multi-client SSH fan-out uses the system
+# `ssh` binary (subprocess), so no Python deps are needed; just have
+# OpenSSH installed and configured for the workers.
 tui = ["textual>=0.80,<1.0", "textual-plotext>=0.4"]
 all = [
-    "asyncssh>=2.14,<3",
     "textual>=0.80,<1.0",
     "textual-plotext>=0.4",
 ]
