@@ -119,12 +119,18 @@ class FioBackend:
 
         argv: list[str] = [local_path]
         argv += ["--output-format=json", f"--output={json_out}"]
-        # Multi-client: append --client= for each fanned-out worker. fio
-        # ignores command-line job options after --client, so the workers
-        # read the job file we pass at the end.
+        # Multi-client: append --client= for each fanned-out worker. fio's
+        # --client wants "host,port" (comma), unlike elbencho's --hosts which
+        # uses "host:port" (colon). hosts_arg() emits the elbencho form, so
+        # we translate here. fio ignores command-line job options after
+        # --client; workers read the job file we pass at the end.
         if hosts:
             for hp in hosts.split(","):
-                argv.append(f"--client={hp}")
+                host_part, _, port_part = hp.partition(":")
+                if port_part:
+                    argv.append(f"--client={host_part},{port_part}")
+                else:
+                    argv.append(f"--client={host_part}")
         argv.append(str(job_file))
 
         return argv, primary_phase
@@ -132,17 +138,20 @@ class FioBackend:
     def parse_results(
         self, raw_dir: Path, *, command: str
     ) -> tuple[dict[str, PhaseResult], EngineArtifactRefs]:
-        """Parse fio's --output-format=json into PhaseResult entries."""
+        """Parse fio's --output-format=json into PhaseResult entries.
+
+        Handles the client/server quirk: fio prefixes the JSON document with
+        host-prefixed status lines (e.g. '<hostname> Starting 8 processes')
+        when writing the master's --output file. We locate the first '{' at
+        the start of a line and parse from there.
+        """
         import json
 
         json_path = raw_dir / "run.json"
         stdout_path = raw_dir / "stdout.log"
         phases: dict[str, PhaseResult] = {}
         if json_path.is_file():
-            try:
-                data = json.loads(json_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                data = None
+            data = _load_fio_json(json_path)
             if isinstance(data, dict):
                 phases = self._phases_from_fio_json(data)
         refs = EngineArtifactRefs(
@@ -157,26 +166,36 @@ class FioBackend:
         """Map fio's JSON output to canonical PhaseResult shapes.
 
         fio JSON structure (abridged):
-          { "jobs": [
-              { "jobname": "...",
-                "read":  { "bw":..., "iops":..., "lat_ns": {...},
-                           "clat_ns": { "min", "max", "mean",
-                                        "percentile": {"50.000000":..., ...} } },
-                "write": { ... same shape ... },
-                "mixed": { ... when rwmixread set ... }, ... } ] }
+          { "jobs": [ { "jobname", "read", "write", "mixed", ... } ],
+            "client_stats": [ { "hostname", "read", "write", ... } ] }
 
-        Multi-client runs add "client_stats" as well; we ignore those here
-        since the master already aggregates into "jobs[*]".
+        Single-process runs populate "jobs". Multi-client runs populate
+        "client_stats" with one entry per worker; the last entry is the
+        aggregate "All clients" rollup (which is what we want).
         """
         out: dict[str, PhaseResult] = {}
-        jobs = data.get("jobs") or []
-        if not jobs:
+        # Prefer the aggregate "All clients" entry from client_stats when
+        # present (multi-client mode). Otherwise use the first job entry.
+        source: dict | None = None
+        client_stats = data.get("client_stats") or []
+        if client_stats:
+            # fio appends a final entry with hostname="All clients" that holds
+            # the aggregate numbers. Find it; fall back to summing.
+            for entry in reversed(client_stats):
+                if isinstance(entry, dict) and entry.get("hostname") == "All clients":
+                    source = entry
+                    break
+            if source is None:
+                source = client_stats[0] if isinstance(client_stats[0], dict) else None
+        if source is None:
+            jobs = data.get("jobs") or []
+            if jobs and isinstance(jobs[0], dict):
+                source = jobs[0]
+        if source is None:
             return out
-        # We expect exactly one job (group_reporting=1). If multiple, take
-        # the first; the user can inspect raw/run.json for the per-job split.
-        job = jobs[0]
+
         for fio_op in ("read", "write", "mixed"):
-            section = job.get(fio_op)
+            section = source.get(fio_op)
             if not isinstance(section, dict):
                 continue
             if not section.get("io_bytes") and not section.get("iops"):
@@ -205,6 +224,37 @@ class FioBackend:
     def service_command(self, client: ClientHost) -> list[str]:
         # `fio --server=,N:<port>` binds to all interfaces on the given port.
         return [client.elbencho_path, f"--server=,N:{client.service_port}"]
+
+
+def _load_fio_json(path: Path) -> dict | None:
+    """Parse fio's --output file, tolerating its client/server preamble.
+
+    In client/server mode fio writes lines like `<hostname> Starting 8 processes`
+    before the JSON document. We find the first line that starts with `{` and
+    parse from there.
+    """
+    import json
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    # Quick happy-path: file is pure JSON.
+    try:
+        data = json.loads(text)
+        return data if isinstance(data, dict) else None
+    except json.JSONDecodeError:
+        pass
+    # Fallback: locate the first '{' at the start of a line and try again.
+    for idx, line in enumerate(text.splitlines()):
+        if line.startswith("{"):
+            tail = "\n".join(text.splitlines()[idx:])
+            try:
+                data = json.loads(tail)
+                return data if isinstance(data, dict) else None
+            except json.JSONDecodeError:
+                return None
+    return None
 
 
 def _phase_from_fio_section(op: str, sec: dict) -> PhaseResult:
