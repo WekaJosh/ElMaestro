@@ -8,37 +8,68 @@ Interactive IO benchmarking harness. Drives [elbencho](https://github.com/breune
 
 ## Install
 
-Requirements: Python 3.11+ and at least one of [elbencho](https://github.com/breuner/elbencho) or [fio](https://github.com/axboe/fio) installed on the coordinator (and on every worker, for multi-client runs).
+You only need one of these. The binary requires nothing but the engine you want to drive (elbencho or fio).
+
+### Option A: prebuilt binary (recommended)
+
+Single-file executable, ~45–60 MB. Bundles the Python interpreter and every Python dep. Drop it on PATH and run.
 
 ```bash
-# 1. Clone and enter the repo
-git clone https://github.com/WekaJosh/ElMaestro.git
-cd ElMaestro
+# 1. Download the right binary for your machine (see dist/ in this repo,
+#    or grab from the GitHub Releases page once a release is cut):
+#      elmaestro-macos-arm64       Apple Silicon
+#      elmaestro-linux-x86_64      Linux x86_64
+curl -L -o /usr/local/bin/elmaestro https://example.com/elmaestro-linux-x86_64
+chmod +x /usr/local/bin/elmaestro
 
-# 2. Create a venv and install. pip works; uv works; pick one.
-python3.11 -m venv .venv   # or `python3 -m venv .venv` if your default is 3.11+
-.venv/bin/pip install -e ".[dev,ssh,tui]"
-
-# 3. Install your engine of choice on every machine that will run workloads.
+# 2. Install the engine on every machine that will actually run IO:
 #    elbencho: https://github.com/breuner/elbencho/releases (Linux),
 #              build from source on macOS
-#    fio:      apt/dnf/brew install fio
+#    fio:      apt install fio  /  dnf install fio  /  brew install fio
+
+# 3. Launch (no args = open the TUI):
+elmaestro
 ```
 
-The `dev` extra installs pytest + ruff, `ssh` adds asyncssh (multi-client fan-out), and `tui` adds Textual. All three are optional; the harness runs with just the base deps for single-host local POSIX work.
+### Option B: from source (developers / contributors)
+
+Requires Python 3.11+.
+
+```bash
+git clone https://github.com/WekaJosh/ElMaestro.git
+cd ElMaestro
+python3.11 -m venv .venv
+.venv/bin/pip install -e ".[dev,ssh,tui]"
+.venv/bin/bench       # same TUI, same subcommands
+```
+
+`dev` installs pytest + ruff, `ssh` adds asyncssh (multi-client fan-out), `tui` adds Textual. All three are optional; the harness runs with just the base deps for single-host local POSIX.
+
+### Building your own binary
+
+```bash
+.venv/bin/pip install pyinstaller
+scripts/build-binary.sh
+# Output: dist/elmaestro-<os>-<arch>
+```
 
 ## Commands
 
+`elmaestro` with no arguments opens the TUI home menu (run / browse / compare / quit). Everything else stays available as a subcommand for scripted use:
+
 ```bash
-.venv/bin/bench version                                  # print version
-.venv/bin/bench validate examples/single_test.yaml       # parse + show summary
-.venv/bin/bench expand   examples/sweep_block_sizes.yaml # dry-run a sweep (no execution)
-.venv/bin/bench run      examples/single_test.yaml       # execute, write results, render report
-.venv/bin/bench run      <cfg> --resume results/<run-dir>  # skip completed specs on retry
-.venv/bin/bench report   results/<run-dir>/              # re-render report.html from result.json
-.venv/bin/bench compare  results/A/ results/B/           # overlay multiple runs in one HTML
-.venv/bin/bench tui      examples/sweep_block_sizes.yaml # Textual UI: live spec progress
+elmaestro                                       # open TUI (default)
+elmaestro version                               # print version
+elmaestro validate examples/single_test.yaml    # parse + show summary
+elmaestro expand   examples/sweep_block_sizes.yaml  # dry-run a sweep (no execution)
+elmaestro run      examples/single_test.yaml    # execute, write results, render report
+elmaestro run      <cfg> --resume results/<run-dir>   # skip completed specs on retry
+elmaestro report   results/<run-dir>/           # re-render report.html from result.json
+elmaestro compare  results/A/ results/B/        # overlay multiple runs in one HTML
+elmaestro tui      examples/sweep_block_sizes.yaml    # jump straight to a config's run screen
 ```
+
+From source: replace `elmaestro` with `.venv/bin/bench` (both entry points are identical).
 
 ## What's in a run
 

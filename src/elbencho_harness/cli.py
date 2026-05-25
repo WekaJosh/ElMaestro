@@ -29,11 +29,26 @@ from .results.store import (
 
 app = typer.Typer(
     add_completion=False,
-    no_args_is_help=True,
-    help="Interactive IO benchmarking harness built on elbencho.",
+    no_args_is_help=False,
+    invoke_without_command=True,
+    help=(
+        "Interactive IO benchmarking harness on elbencho + fio.\n\n"
+        "Run with no arguments to open the TUI. Subcommands stay available "
+        "for scripted use."
+    ),
 )
 console = Console()
 err_console = Console(stderr=True, style="red")
+
+
+@app.callback()
+def _default(ctx: typer.Context) -> None:
+    """When no subcommand is given, open the TUI home menu."""
+    if ctx.invoked_subcommand is None:
+        from .tui import run_home
+
+        run_home()
+        raise typer.Exit()
 
 
 @app.command()

@@ -6,11 +6,14 @@ __pycache__/
 .Python
 *.egg-info/
 .eggs/
-build/
-dist/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+
+# Build artifacts (anchored so they don't accidentally shadow a Python
+# module with the same name; cf. the earlier /results/ rule)
+/build/
+/dist/
 
 # Virtualenv / uv
 .venv/
