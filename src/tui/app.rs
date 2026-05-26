@@ -7,7 +7,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -36,11 +38,12 @@ impl App {
     }
 
     pub fn run(&mut self) -> Result<()> {
-        // Init terminal. NO mouse capture: must work in tmux/screen
-        // sessions where mouse support is unavailable.
+        // Init terminal. Mouse capture is enabled (works in any terminal
+        // that supports it); keyboard navigation works regardless, so this
+        // is no-loss in tmux/screen sessions that don't pass mouse events.
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
@@ -48,7 +51,7 @@ impl App {
 
         // Restore terminal regardless of how we exit.
         disable_raw_mode().ok();
-        execute!(io::stdout(), LeaveAlternateScreen).ok();
+        execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture).ok();
         terminal.show_cursor().ok();
         result
     }

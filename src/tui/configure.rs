@@ -457,11 +457,11 @@ fn default_fields() -> Vec<Field> {
             hint: "(per-thread file size; blank if using duration)",
         },
         Field::Text {
-            label: "Files / job",
+            label: "Files per thread",
             value: "4".into(),
             cursor: 1,
             placeholder: "4",
-            hint: "(typically 4-8)",
+            hint: "(total files = Threads × this, e.g. 8 × 4 = 32 files)",
         },
         Field::Text {
             label: "Duration (s)",
@@ -581,9 +581,12 @@ fn build_plan(fields: &[Field]) -> Result<(RunPlan, String, usize)> {
     } else {
         Some(parse_bytesize_string(file_size_raw).map_err(|e| anyhow!("File size: {}", e))?)
     };
-    let files_per_job: Option<u32> = match field_text(fields, "Files / job").trim() {
+    let files_per_thread: Option<u32> = match field_text(fields, "Files per thread").trim() {
         "" => None,
-        s => Some(s.parse().map_err(|_| anyhow!("Files / job must be an integer"))?),
+        s => Some(
+            s.parse()
+                .map_err(|_| anyhow!("Files per thread must be an integer"))?,
+        ),
     };
 
     let duration_raw = field_text(fields, "Duration (s)").trim();
@@ -621,7 +624,7 @@ fn build_plan(fields: &[Field]) -> Result<(RunPlan, String, usize)> {
         duration_s,
         dataset_size: None,
         file_size,
-        file_count: files_per_job,
+        file_count: files_per_thread,
         s3_multipart_size: None,
         s3_object_prefix: None,
         extra_flags: Vec::new(),
