@@ -2,6 +2,7 @@
 //!
 //! Screen-stack pattern: push/pop screens as the user navigates.
 
+use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,14 +10,11 @@ use std::sync::Once;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::cursor::Show as ShowCursor;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    self, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
 };
 use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
@@ -61,18 +59,45 @@ impl TerminalGuard {
     /// Idempotent: only emits restore sequences if we actually entered raw
     /// mode. Safe to call from both Drop and the panic hook without double
     /// cleanup.
+    ///
+    /// We write raw ANSI bytes directly (rather than using crossterm's
+    /// DisableMouseCapture + LeaveAlternateScreen commands) for two reasons:
+    ///   1. crossterm 0.28's DisableMouseCapture sends 1006l/1015l/1002l/1000l
+    ///      but NOT 1003l (any-event tracking). Real-world bug: on RHEL with
+    ///      certain terminal emulators, SGR mouse events like "0;119;41m"
+    ///      kept leaking into the shell after exit despite crossterm's
+    ///      disable sequence. The 1003l covers that.
+    ///   2. Writing to /dev/tty (the controlling terminal) bypasses any
+    ///      stdout buffering or redirection races at process exit and is
+    ///      strictly more reliable than relying on stdout to flush in time.
     fn cleanup() {
         if !TERMINAL_ACTIVE.swap(false, Ordering::SeqCst) {
             return;
         }
         let _ = disable_raw_mode();
+
+        // ?1003l = any-event (motion) tracking off
+        // ?1002l = button-event tracking off
+        // ?1000l = X10 mouse mode off
+        // ?1015l = urxvt mouse mode off
+        // ?1006l = SGR mouse mode off (this is the one that produced the
+        //          "0;119;41m" sequences leaking on weka54)
+        // ?1049l = leave xterm alternate screen buffer
+        // ?25h   = show cursor
+        // [m     = reset SGR attributes (colors / bold / etc.)
+        const RESTORE: &[u8] =
+            b"\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1015l\x1b[?1006l\x1b[?1049l\x1b[?25h\x1b[m";
+
+        // Prefer /dev/tty: hits the controlling terminal even if stdout is
+        // redirected, and dodges stdout flush races at process teardown.
+        if let Ok(mut tty) = OpenOptions::new().write(true).open("/dev/tty") {
+            let _ = tty.write_all(RESTORE);
+            let _ = tty.flush();
+        }
+        // Belt-and-suspenders fallback in case /dev/tty isn't openable
+        // (containers without a controlling terminal, etc.).
         let mut stdout = io::stdout();
-        let _ = execute!(
-            stdout,
-            DisableMouseCapture,
-            LeaveAlternateScreen,
-            ShowCursor,
-        );
+        let _ = stdout.write_all(RESTORE);
         let _ = stdout.flush();
     }
 }
