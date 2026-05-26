@@ -76,17 +76,26 @@ impl TerminalGuard {
         }
         let _ = disable_raw_mode();
 
+        // Order matters. Leave the alt screen FIRST so the disable codes
+        // run in the same context as if the user typed them at the shell:
+        // a bare `printf '\033[?1006l...'` from the prompt reliably disables
+        // mouse tracking on Terminal.app, but sending the same bytes while
+        // still inside the alt screen does not — Terminal.app appears to
+        // save and restore mouse state across the alt-screen boundary, so
+        // disables emitted inside the alt screen get undone the moment we
+        // switch back to the main buffer.
+        //
+        // ?1049l = leave xterm alternate screen buffer (do this first)
         // ?1003l = any-event (motion) tracking off
         // ?1002l = button-event tracking off
         // ?1000l = X10 mouse mode off
         // ?1015l = urxvt mouse mode off
-        // ?1006l = SGR mouse mode off (this is the one that produced the
-        //          "0;119;41m" sequences leaking on weka54)
-        // ?1049l = leave xterm alternate screen buffer
+        // ?1006l = SGR mouse mode off (this is what produced the
+        //          "0;...m" sequences leaking on weka54)
         // ?25h   = show cursor
         // [m     = reset SGR attributes (colors / bold / etc.)
         const RESTORE: &[u8] =
-            b"\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1015l\x1b[?1006l\x1b[?1049l\x1b[?25h\x1b[m";
+            b"\x1b[?1049l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1015l\x1b[?1006l\x1b[?25h\x1b[m";
 
         // Prefer /dev/tty: hits the controlling terminal even if stdout is
         // redirected, and dodges stdout flush races at process teardown.
