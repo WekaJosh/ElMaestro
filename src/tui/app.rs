@@ -207,7 +207,18 @@ impl App {
                     }
                     Event::Mouse(m) => {
                         use crossterm::event::{MouseButton, MouseEventKind};
-                        if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+                        // Fire on Up (release), not Down (press). Two reasons:
+                        //   1. That's how every conventional GUI button
+                        //      behaves — press-and-drag-away cancels.
+                        //   2. Avoids the v1.3.0-1.3.3 mouse-leak symptom:
+                        //      if we exit on Down, the matching Up event
+                        //      arrives at the shell some tens of ms later
+                        //      (SSH round-trip vs click duration), and the
+                        //      terminal hasn't applied our disable codes
+                        //      yet — so it splatters "0;col;row;m" into
+                        //      the prompt. Triggering on Up means the Up
+                        //      IS our exit signal; no later event in flight.
+                        if let MouseEventKind::Up(MouseButton::Left) = m.kind {
                             if self.handle_click(m.column, m.row) {
                                 return Ok(());
                             }
