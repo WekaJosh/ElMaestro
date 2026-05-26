@@ -19,7 +19,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use super::runner::{plan_pairs, RunEvent};
+use super::runner::{plan_pairs, RunEvent, SpecMetrics};
 
 /// Top-level screen identity. Screens are stack-pushed via App::push.
 pub enum Screen {
@@ -29,6 +29,7 @@ pub enum Screen {
     Run(RunScreen),
     Browse(BrowseScreen),
     Compare(CompareScreen),
+    Report(ReportScreen),
 }
 
 // ---------------------------------------------------------------------------
@@ -351,6 +352,12 @@ pub struct RowState {
     pub axis_label: String,
     pub status: String,
     pub duration: String,
+    /// Metrics shown live as each spec finishes. Populated from
+    /// RunEvent::SpecFinished.
+    pub metrics: Option<SpecMetrics>,
+    /// Path to result.json on disk so the Report viewer can load it
+    /// when the user presses Enter on this row.
+    pub result_path: Option<PathBuf>,
 }
 
 impl RunScreen {
@@ -429,6 +436,8 @@ impl RunScreen {
                 axis_label,
                 status: "queued".into(),
                 duration: String::new(),
+                metrics: None,
+                result_path: None,
             });
         }
     }
@@ -451,12 +460,22 @@ impl RunScreen {
             chunks[0],
         );
 
-        let header = Row::new(vec!["#", "target", "workload", "axes", "status", "duration"])
-            .style(
-                Style::default()
-                    .fg(Color::Rgb(0x8b, 0x94, 0x9e))
-                    .add_modifier(Modifier::BOLD),
-            );
+        let header = Row::new(vec![
+            "#",
+            "target",
+            "workload",
+            "axes",
+            "status",
+            "dur",
+            "throughput",
+            "iops",
+            "p95 lat",
+        ])
+        .style(
+            Style::default()
+                .fg(Color::Rgb(0x8b, 0x94, 0x9e))
+                .add_modifier(Modifier::BOLD),
+        );
         let rows: Vec<Row> = self
             .rows
             .iter()
@@ -470,6 +489,14 @@ impl RunScreen {
                     }
                     _ => Style::default().fg(Color::Rgb(0x8b, 0x94, 0x9e)),
                 };
+                let (tput, iops, p95) = match &r.metrics {
+                    Some(m) => (
+                        format_throughput(m.throughput_mib_s),
+                        format_iops(m.iops),
+                        format_latency(m.lat_p95_us),
+                    ),
+                    None => (String::new(), String::new(), String::new()),
+                };
                 Row::new(vec![
                     Cell::from(format!("{:04}", r.idx)),
                     Cell::from(r.target.clone()),
@@ -477,15 +504,21 @@ impl RunScreen {
                     Cell::from(r.axis_label.clone()),
                     Cell::from(r.status.clone()).style(status_style),
                     Cell::from(r.duration.clone()),
+                    Cell::from(tput),
+                    Cell::from(iops),
+                    Cell::from(p95),
                 ])
             })
             .collect();
         let widths = [
-            Constraint::Length(6),
-            Constraint::Length(18),
-            Constraint::Length(18),
-            Constraint::Length(18),
+            Constraint::Length(5),
+            Constraint::Length(12),
             Constraint::Length(14),
+            Constraint::Length(14),
+            Constraint::Length(10),
+            Constraint::Length(7),
+            Constraint::Length(13),
+            Constraint::Length(9),
             Constraint::Length(10),
         ];
         let table = Table::new(rows, widths)
@@ -499,9 +532,9 @@ impl RunScreen {
         frame.render_stateful_widget(table, chunks[1], &mut self.table_state);
 
         let footer_text = if self.running {
-            "Running... [esc] cannot interrupt mid-run"
+            "Running... [↑/↓] highlight · [enter] view report · [esc] cannot interrupt mid-run"
         } else if self.finished {
-            "Done. [esc] back to home"
+            "Done. [↑/↓] select · [enter] view report · [esc] back to home"
         } else {
             "[r] run · [esc] back · [↑/↓] navigate"
         };
@@ -582,11 +615,15 @@ impl RunScreen {
                 index,
                 status,
                 duration_s,
+                metrics,
+                result_path,
                 ..
             } => {
                 if let Some(row) = self.rows.iter_mut().find(|r| r.idx == index) {
                     row.status = status.label();
                     row.duration = format!("{:.1}s", duration_s);
+                    row.metrics = metrics;
+                    row.result_path = result_path;
                 }
             }
             RunEvent::RunFinished {
@@ -610,6 +647,37 @@ impl RunScreen {
             }
         }
     }
+
+    pub fn select_next(&mut self) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let next = match self.table_state.selected() {
+            Some(i) if i + 1 < self.rows.len() => i + 1,
+            Some(_) => self.rows.len() - 1,
+            None => 0,
+        };
+        self.table_state.select(Some(next));
+    }
+
+    pub fn select_prev(&mut self) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let prev = match self.table_state.selected() {
+            Some(0) | None => 0,
+            Some(i) => i - 1,
+        };
+        self.table_state.select(Some(prev));
+    }
+
+    /// Path to result.json for the currently-highlighted row, if it
+    /// finished successfully. Used by the Enter handler to push a
+    /// ReportScreen.
+    pub fn selected_result_path(&self) -> Option<PathBuf> {
+        let idx = self.table_state.selected()?;
+        self.rows.get(idx).and_then(|r| r.result_path.clone())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -622,6 +690,11 @@ pub struct BrowseScreen {
     state: TableState,
     pub error: Option<String>,
     table_rect: Rect,
+    /// Set by click_at when the user clicks a row. The app reads + clears
+    /// this to push a ReportScreen for the selected run's first spec
+    /// (replaces the old open-in-browser behavior that didn't work over
+    /// SSH).
+    pending_open: Option<PathBuf>,
 }
 
 struct RunRow {
@@ -639,6 +712,7 @@ impl BrowseScreen {
             state: TableState::default(),
             error: None,
             table_rect: Rect::default(),
+            pending_open: None,
         };
         s.refresh();
         s
@@ -752,7 +826,7 @@ impl BrowseScreen {
         let footer = self
             .error
             .clone()
-            .unwrap_or_else(|| "↑/↓ move · Enter open report · Esc back".into());
+            .unwrap_or_else(|| "↑/↓ move · Enter view report (in-TUI) · Esc back".into());
         frame.render_widget(
             Paragraph::new(Span::styled(footer, footer_style)),
             chunks[3],
@@ -775,16 +849,13 @@ impl BrowseScreen {
         self.state.select(Some((i + self.runs.len() - 1) % self.runs.len()));
     }
 
-    /// Hit-test a click. Selects the row and opens its report (mimics
-    /// Enter on a focused row).
+    /// Hit-test a click. Selects the row and queues a report-open
+    /// (consumed by the app event loop, which pushes a ReportScreen).
     pub fn click_at(&mut self, col: u16, row: u16) {
         if !rect_contains(self.table_rect, col, row) {
             return;
         }
-        // Skip the table's header + border lines. The table widget renders
-        // a border (top line) and a header (1 line), so data rows start at
-        // y + 2.
-        let header_offset = 2u16;
+        let header_offset = 2u16; // top border + header line
         if row < self.table_rect.y + header_offset {
             return;
         }
@@ -793,43 +864,66 @@ impl BrowseScreen {
             return;
         }
         self.state.select(Some(idx));
-        self.open_selected();
+        self.pending_open = self.first_spec_result_path();
     }
 
-    pub fn open_selected(&mut self) {
-        let Some(idx) = self.state.selected() else {
-            return;
-        };
-        let Some(run) = self.runs.get(idx) else {
-            return;
-        };
-        let report = run.path.join("report.html");
-        let final_path = if report.is_file() {
-            report
-        } else {
-            // Fall back to first spec's report.
-            let mut alt = None;
-            if let Ok(read) = std::fs::read_dir(&run.path) {
-                for e in read.flatten() {
-                    if e.path().is_dir() {
-                        let candidate = e.path().join("report.html");
-                        if candidate.is_file() {
-                            alt = Some(candidate);
-                            break;
-                        }
-                    }
+    /// App reads + clears this after dispatching the click. Avoids the
+    /// BrowseScreen needing a reference to the app's screen stack.
+    pub fn consume_pending_open(&mut self) -> Option<PathBuf> {
+        self.pending_open.take()
+    }
+
+    /// Path to result.json for the highlighted run's first spec. Used to
+    /// push an in-TUI ReportScreen on Enter / click.
+    pub fn first_spec_result_path(&mut self) -> Option<PathBuf> {
+        let idx = self.state.selected()?;
+        let run = self.runs.get(idx)?;
+        if let Ok(read) = std::fs::read_dir(&run.path) {
+            let mut dirs: Vec<PathBuf> = read
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
+            dirs.sort();
+            for d in dirs {
+                let rp = d.join("result.json");
+                if rp.is_file() {
+                    return Some(rp);
                 }
             }
-            match alt {
-                Some(p) => p,
-                None => {
-                    self.error = Some("no report.html found".into());
-                    return;
-                }
-            }
-        };
-        open_in_browser(&final_path);
-        self.error = Some(format!("opened {}", final_path.display()));
+        }
+        self.error = Some("no result.json in this run".into());
+        None
+    }
+}
+
+// Human-formatted metric helpers shared by the Run screen and the in-TUI
+// report viewer. All take `Option<f64>` so a missing metric renders as a
+// dim "—" rather than blowing up the table layout.
+
+pub(super) fn format_throughput(v: Option<f64>) -> String {
+    match v {
+        Some(x) if x >= 1024.0 => format!("{:.2} GiB/s", x / 1024.0),
+        Some(x) if x >= 1.0 => format!("{:.0} MiB/s", x),
+        Some(x) => format!("{:.2} MiB/s", x),
+        None => "—".into(),
+    }
+}
+
+pub(super) fn format_iops(v: Option<f64>) -> String {
+    match v {
+        Some(x) if x >= 1_000_000.0 => format!("{:.2}M", x / 1_000_000.0),
+        Some(x) if x >= 1_000.0 => format!("{:.1}k", x / 1_000.0),
+        Some(x) => format!("{:.0}", x),
+        None => "—".into(),
+    }
+}
+
+pub(super) fn format_latency(v: Option<f64>) -> String {
+    match v {
+        Some(x) if x >= 1000.0 => format!("{:.1} ms", x / 1000.0),
+        Some(x) => format!("{:.0} µs", x),
+        None => "—".into(),
     }
 }
 
@@ -1083,4 +1177,450 @@ fn inner_rect(area: Rect, pad_x: u16, pad_y: u16) -> Rect {
         area.width.saturating_sub(pad_x * 2),
         area.height.saturating_sub(pad_y * 2),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Report viewer (renders a per-spec result natively in the TUI; replaces the
+// xdg-open-the-html-file path that doesn't work over SSH)
+// ---------------------------------------------------------------------------
+
+/// One sibling spec in the same run directory. Used for the
+/// throughput-across-sweep bar chart at the bottom of the Report screen.
+struct SiblingSpec {
+    label: String,
+    result_path: PathBuf,
+    metrics: SpecMetrics,
+}
+
+pub struct ReportScreen {
+    /// Result currently being shown.
+    result: Option<crate::results::schema::Result>,
+    /// All sibling specs in the same run dir, ordered by index. The
+    /// `selected` field is an index into this vec.
+    siblings: Vec<SiblingSpec>,
+    selected: usize,
+    /// Path to the original result.json (used to figure out the run dir
+    /// for sibling discovery and to construct the report.html path for
+    /// the 'b' shortcut).
+    source_path: PathBuf,
+    message: Option<String>,
+}
+
+impl ReportScreen {
+    pub fn new(result_path: PathBuf) -> Self {
+        let mut s = Self {
+            result: None,
+            siblings: Vec::new(),
+            selected: 0,
+            source_path: result_path.clone(),
+            message: None,
+        };
+        s.load(&result_path);
+        s.scan_siblings(&result_path);
+        s
+    }
+
+    fn load(&mut self, p: &Path) {
+        match std::fs::read_to_string(p)
+            .map_err(|e| anyhow::anyhow!("{}", e))
+            .and_then(|t| serde_json::from_str::<crate::results::schema::Result>(&t).map_err(Into::into))
+        {
+            Ok(r) => self.result = Some(r),
+            Err(e) => self.message = Some(format!("Failed to load {}: {:#}", p.display(), e)),
+        }
+    }
+
+    fn scan_siblings(&mut self, current: &Path) {
+        // Sibling specs live as sibling directories of `current`'s parent
+        // (i.e. the run dir contains 0001_*/, 0002_*/, ..., each with a
+        // result.json). Order by directory name so indices match the spec
+        // ordering the user saw in the Run screen.
+        let Some(spec_dir) = current.parent() else { return };
+        let Some(run_dir) = spec_dir.parent() else { return };
+        let mut entries: Vec<PathBuf> = match std::fs::read_dir(run_dir) {
+            Ok(it) => it
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect(),
+            Err(_) => return,
+        };
+        entries.sort();
+        for dir in entries {
+            let rp = dir.join("result.json");
+            if !rp.is_file() {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&rp) else {
+                continue;
+            };
+            let Ok(r) = serde_json::from_str::<crate::results::schema::Result>(&text) else {
+                continue;
+            };
+            let metrics = SpecMetrics::from_result(&r);
+            // Use the sweep-axis suffix from the directory name as the
+            // chart label ("0003_local-tmp_seq-read-base_bs-1MiB" → "bs-1MiB").
+            // Falls back to the directory name.
+            let dname = dir
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let label = dname
+                .splitn(4, '_')
+                .nth(3)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| dname.clone());
+            if dir == spec_dir {
+                self.selected = self.siblings.len();
+            }
+            self.siblings.push(SiblingSpec {
+                label,
+                result_path: rp,
+                metrics,
+            });
+        }
+    }
+
+    /// Jump the viewer to the next sibling spec without leaving the screen.
+    pub fn select_next(&mut self) {
+        if self.siblings.is_empty() {
+            return;
+        }
+        self.selected = (self.selected + 1).min(self.siblings.len() - 1);
+        let p = self.siblings[self.selected].result_path.clone();
+        self.source_path = p.clone();
+        self.load(&p);
+    }
+
+    pub fn select_prev(&mut self) {
+        if self.siblings.is_empty() {
+            return;
+        }
+        if self.selected > 0 {
+            self.selected -= 1;
+        }
+        let p = self.siblings[self.selected].result_path.clone();
+        self.source_path = p.clone();
+        self.load(&p);
+    }
+
+    /// Open the matching report.html in a browser. Best-effort; on SSH
+    /// without DISPLAY this silently fails (which is fine because the
+    /// in-TUI view already shows everything that matters).
+    pub fn open_html(&mut self) {
+        let html = self.source_path.with_file_name("report.html");
+        if html.is_file() {
+            open_in_browser(&html);
+            self.message = Some(format!("opened {}", html.display()));
+        } else {
+            self.message = Some(format!("no report.html next to {}", self.source_path.display()));
+        }
+    }
+
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+        let outer = Block::default()
+            .borders(Borders::ALL)
+            .title(self.title_line())
+            .padding(Padding::horizontal(1));
+        let inner = outer.inner(area);
+        frame.render_widget(outer, area);
+
+        let result = match &self.result {
+            Some(r) => r.clone(),
+            None => {
+                let msg = self.message.as_deref().unwrap_or("(no result loaded)");
+                frame.render_widget(Paragraph::new(msg).wrap(Wrap { trim: true }), inner);
+                return;
+            }
+        };
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(7), // metrics row
+                Constraint::Length(9), // workload + target row
+                Constraint::Min(5),    // sweep chart (flex)
+                Constraint::Length(1), // footer
+            ])
+            .split(inner);
+
+        self.render_metrics_row(frame, chunks[0], &result);
+        self.render_meta_row(frame, chunks[1], &result);
+        self.render_sweep_chart(frame, chunks[2]);
+        self.render_footer(frame, chunks[3]);
+    }
+
+    fn title_line(&self) -> String {
+        let idx_part = if !self.siblings.is_empty() {
+            format!(" {}/{}", self.selected + 1, self.siblings.len())
+        } else {
+            String::new()
+        };
+        let label = self
+            .siblings
+            .get(self.selected)
+            .map(|s| s.label.as_str())
+            .unwrap_or("");
+        format!(" Report{} · {} ", idx_part, label)
+    }
+
+    fn render_metrics_row(&self, frame: &mut Frame, area: Rect, r: &crate::results::schema::Result) {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(33),
+                Constraint::Percentage(33),
+                Constraint::Percentage(34),
+            ])
+            .split(area);
+
+        let m = self
+            .siblings
+            .get(self.selected)
+            .map(|s| s.metrics.clone())
+            .unwrap_or_else(|| SpecMetrics::from_result(r));
+
+        let tput_block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Throughput ")
+            .padding(Padding::horizontal(1));
+        let tput_inner = tput_block.inner(cols[0]);
+        frame.render_widget(tput_block, cols[0]);
+        let tput_lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format_throughput(m.throughput_mib_s),
+                Style::default()
+                    .fg(Color::Rgb(0x3f, 0xb9, 0x50))
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!("({})", m.primary_phase),
+                Style::default().fg(Color::Rgb(0x8b, 0x94, 0x9e)),
+            )),
+        ];
+        frame.render_widget(Paragraph::new(tput_lines), tput_inner);
+
+        let iops_block = Block::default()
+            .borders(Borders::ALL)
+            .title(" IOPS ")
+            .padding(Padding::horizontal(1));
+        let iops_inner = iops_block.inner(cols[1]);
+        frame.render_widget(iops_block, cols[1]);
+        let iops_lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format_iops(m.iops),
+                Style::default()
+                    .fg(Color::Rgb(0x58, 0xa6, 0xff))
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                if m.errors > 0 {
+                    format!("{} errors", m.errors)
+                } else {
+                    "no errors".into()
+                },
+                Style::default().fg(if m.errors > 0 {
+                    Color::Rgb(0xf8, 0x51, 0x49)
+                } else {
+                    Color::Rgb(0x8b, 0x94, 0x9e)
+                }),
+            )),
+        ];
+        frame.render_widget(Paragraph::new(iops_lines), iops_inner);
+
+        let lat_block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Latency ")
+            .padding(Padding::horizontal(1));
+        let lat_inner = lat_block.inner(cols[2]);
+        frame.render_widget(lat_block, cols[2]);
+        let lat_lines = vec![
+            Line::from(vec![
+                Span::styled("avg  ", Style::default().fg(Color::Rgb(0x8b, 0x94, 0x9e))),
+                Span::raw(format_latency(m.lat_avg_us)),
+            ]),
+            Line::from(vec![
+                Span::styled("p50  ", Style::default().fg(Color::Rgb(0x8b, 0x94, 0x9e))),
+                Span::raw(format_latency(m.lat_p50_us)),
+            ]),
+            Line::from(vec![
+                Span::styled("p95  ", Style::default().fg(Color::Rgb(0x8b, 0x94, 0x9e))),
+                Span::raw(format_latency(m.lat_p95_us)),
+            ]),
+            Line::from(vec![
+                Span::styled("p99  ", Style::default().fg(Color::Rgb(0x8b, 0x94, 0x9e))),
+                Span::raw(format_latency(m.lat_p99_us)),
+            ]),
+        ];
+        frame.render_widget(Paragraph::new(lat_lines), lat_inner);
+    }
+
+    fn render_meta_row(&self, frame: &mut Frame, area: Rect, r: &crate::results::schema::Result) {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(area);
+
+        let wl_block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Workload ")
+            .padding(Padding::horizontal(1));
+        let wl_inner = wl_block.inner(cols[0]);
+        frame.render_widget(wl_block, cols[0]);
+        let bs_label = human_bytes_u64(r.workload.block_size);
+        let fsz = r
+            .workload
+            .file_size
+            .map(human_bytes_u64)
+            .unwrap_or_else(|| "—".into());
+        let fcount = r
+            .workload
+            .file_count
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "—".into());
+        let dur = r
+            .workload
+            .duration_s
+            .map(|d| format!("{}s", d))
+            .unwrap_or_else(|| "—".into());
+        let wl_lines = vec![
+            Line::from(meta_line("pattern", &r.workload.pattern)),
+            Line::from(meta_line("block", &bs_label)),
+            Line::from(meta_line(
+                "rw mix",
+                &format!("{}% read", r.workload.rw_mix_pct_read),
+            )),
+            Line::from(meta_line(
+                "threads",
+                &r.workload.threads_per_client.to_string(),
+            )),
+            Line::from(meta_line("iodepth", &r.workload.io_depth.to_string())),
+            Line::from(meta_line("files", &format!("{} × {}", fcount, fsz))),
+            Line::from(meta_line("duration", &dur)),
+        ];
+        frame.render_widget(Paragraph::new(wl_lines), wl_inner);
+
+        let tg_block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Target ")
+            .padding(Padding::horizontal(1));
+        let tg_inner = tg_block.inner(cols[1]);
+        frame.render_widget(tg_block, cols[1]);
+        let mut tg_lines = vec![
+            Line::from(meta_line("kind", &r.target.kind)),
+            Line::from(meta_line("name", &r.target.name)),
+        ];
+        for (k, v) in r.target.detail.iter() {
+            let val = match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            tg_lines.push(Line::from(meta_line(k, &val)));
+        }
+        let hosts: Vec<String> = r.clients.iter().map(|c| c.host.clone()).collect();
+        tg_lines.push(Line::from(meta_line("hosts", &hosts.join(", "))));
+        frame.render_widget(Paragraph::new(tg_lines), tg_inner);
+    }
+
+    fn render_sweep_chart(&self, frame: &mut Frame, area: Rect) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Throughput across run  (▶ current spec) ")
+            .padding(Padding::horizontal(1));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if self.siblings.is_empty() {
+            frame.render_widget(
+                Paragraph::new("(no sibling specs)").style(
+                    Style::default().fg(Color::Rgb(0x8b, 0x94, 0x9e)),
+                ),
+                inner,
+            );
+            return;
+        }
+
+        // Horizontal text-bar chart. ratatui's BarChart is column-only and
+        // doesn't show the value next to each bar in a horizontal layout
+        // the way we want, so render manually.
+        let max = self
+            .siblings
+            .iter()
+            .filter_map(|s| s.metrics.throughput_mib_s)
+            .fold(0.0_f64, f64::max)
+            .max(1.0);
+        let label_w = self
+            .siblings
+            .iter()
+            .map(|s| s.label.chars().count())
+            .max()
+            .unwrap_or(8) as u16;
+        let bar_max = inner.width.saturating_sub(label_w + 4 + 14);
+        let mut lines = Vec::new();
+        for (i, s) in self.siblings.iter().enumerate() {
+            let v = s.metrics.throughput_mib_s.unwrap_or(0.0);
+            let frac = (v / max).clamp(0.0, 1.0);
+            let bar_len = (frac * bar_max as f64).round() as usize;
+            let bar: String = "█".repeat(bar_len);
+            let marker = if i == self.selected { "▶ " } else { "  " };
+            let value = format_throughput(s.metrics.throughput_mib_s);
+            let style = if i == self.selected {
+                Style::default()
+                    .fg(Color::Rgb(0x3f, 0xb9, 0x50))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Rgb(0x58, 0xa6, 0xff))
+            };
+            lines.push(Line::from(vec![
+                Span::styled(marker.to_string(), style),
+                Span::styled(format!("{:>width$}  ", s.label, width = label_w as usize), style),
+                Span::styled(bar, style),
+                Span::raw(format!("  {}", value)),
+            ]));
+        }
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn render_footer(&self, frame: &mut Frame, area: Rect) {
+        let msg = self.message.clone().unwrap_or_else(|| {
+            "[↑/↓] cycle specs · [b] open report.html · [esc] back".into()
+        });
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                msg,
+                Style::default().fg(Color::Rgb(0x8b, 0x94, 0x9e)),
+            )),
+            area,
+        );
+    }
+}
+
+fn meta_line(k: &str, v: impl Into<String>) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(
+            format!("{:<10}", k),
+            Style::default().fg(Color::Rgb(0x8b, 0x94, 0x9e)),
+        ),
+        Span::raw(v.into()),
+    ]
+}
+
+fn human_bytes_u64(n: u64) -> String {
+    const U: &[(u64, &str)] = &[
+        (1 << 40, "TiB"),
+        (1 << 30, "GiB"),
+        (1 << 20, "MiB"),
+        (1 << 10, "KiB"),
+    ];
+    for (sz, unit) in U {
+        if n >= *sz {
+            let v = n as f64 / *sz as f64;
+            if v.fract() < 0.05 {
+                return format!("{:.0} {}", v, unit);
+            }
+            return format!("{:.2} {}", v, unit);
+        }
+    }
+    format!("{} B", n)
 }

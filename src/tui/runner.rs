@@ -9,6 +9,41 @@ use chrono::Utc;
 use crate::backends::get_backend;
 use crate::config::{loader, sweep, RunPlan, RunSpec};
 
+/// Metrics extracted from a finished spec's PhaseResult, formatted for live
+/// display in the Run screen + the in-TUI report viewer. All fields are
+/// optional because some engines / phases don't populate every field.
+#[derive(Debug, Clone, Default)]
+pub struct SpecMetrics {
+    pub primary_phase: String,
+    pub throughput_mib_s: Option<f64>,
+    pub iops: Option<f64>,
+    pub lat_avg_us: Option<f64>,
+    pub lat_p50_us: Option<f64>,
+    pub lat_p95_us: Option<f64>,
+    pub lat_p99_us: Option<f64>,
+    pub errors: u64,
+}
+
+impl SpecMetrics {
+    pub fn from_result(r: &crate::results::schema::Result) -> Self {
+        let phase = r.phases.get(&r.primary_phase);
+        let mut m = SpecMetrics {
+            primary_phase: r.primary_phase.clone(),
+            ..Default::default()
+        };
+        if let Some(p) = phase {
+            m.throughput_mib_s = p.throughput_mib_s_last.or(p.throughput_mib_s_first);
+            m.iops = p.iops_last.or(p.iops_first);
+            m.lat_avg_us = p.io_lat_us.avg;
+            m.lat_p50_us = p.latency_percentiles_us.get("p50").copied();
+            m.lat_p95_us = p.latency_percentiles_us.get("p95").copied();
+            m.lat_p99_us = p.latency_percentiles_us.get("p99").copied();
+            m.errors = p.errors;
+        }
+        m
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum RunEvent {
     RunStarted {
@@ -30,6 +65,12 @@ pub enum RunEvent {
         status: SpecStatus,
         duration_s: f64,
         report_path: Option<PathBuf>,
+        /// Path to result.json for the in-TUI report viewer to load.
+        result_path: Option<PathBuf>,
+        /// Headline metrics (throughput / IOPS / latency) for live display
+        /// in the Run screen. `None` when the spec errored before producing
+        /// a result.
+        metrics: Option<SpecMetrics>,
     },
     RunFinished {
         run_dir: PathBuf,
@@ -152,11 +193,12 @@ fn execute_one_iteration(plan: &RunPlan, label: &str, tx: &Sender<RunEvent>) -> 
         let started = Utc::now();
         let _ = tx.send(RunEvent::SpecStarted { index: idx + 1 });
 
-        let (status, report_path) =
+        let (status, report_path, result_path, metrics) =
             match crate::engine::run_spec(spec, &spec_dir, None, backend.as_ref()) {
                 Ok(result) => {
                     let json = serde_json::to_string_pretty(&result)?;
-                    std::fs::write(spec_dir.join("result.json"), json)?;
+                    let result_path = spec_dir.join("result.json");
+                    std::fs::write(&result_path, json)?;
                     let report_path = spec_dir.join("report.html");
                     let _ = crate::report::render_single(&result, &report_path, None);
                     let st = if result.elbencho_exit_code == 0 {
@@ -166,11 +208,12 @@ fn execute_one_iteration(plan: &RunPlan, label: &str, tx: &Sender<RunEvent>) -> 
                         failed += 1;
                         SpecStatus::Failed(result.elbencho_exit_code)
                     };
-                    (st, Some(report_path))
+                    let metrics = SpecMetrics::from_result(&result);
+                    (st, Some(report_path), Some(result_path), Some(metrics))
                 }
                 Err(_) => {
                     failed += 1;
-                    (SpecStatus::Error, None)
+                    (SpecStatus::Error, None, None, None)
                 }
             };
         let duration_s = (Utc::now() - started).num_milliseconds() as f64 / 1000.0;
@@ -180,6 +223,8 @@ fn execute_one_iteration(plan: &RunPlan, label: &str, tx: &Sender<RunEvent>) -> 
             status,
             duration_s,
             report_path,
+            result_path,
+            metrics,
         });
 
         let axis_values: Option<serde_json::Value> = point.as_ref().map(|p| {

@@ -169,6 +169,7 @@ impl App {
                         Screen::Run(s) => s.render(frame, area),
                         Screen::Browse(s) => s.render(frame, area),
                         Screen::Compare(s) => s.render(frame, area),
+                        Screen::Report(s) => s.render(frame, area),
                     }
                 }
             })?;
@@ -281,11 +282,14 @@ impl App {
             }
             Some(Screen::Browse(b)) => {
                 b.click_at(col, row);
+                if let Some(path) = b.consume_pending_open() {
+                    self.apply_nav(NavAction::PushReport(path));
+                }
             }
             Some(Screen::Compare(c)) => {
                 c.click_at(col, row);
             }
-            Some(Screen::Run(_)) | None => {}
+            Some(Screen::Run(_)) | Some(Screen::Report(_)) | None => {}
         }
         false
     }
@@ -382,28 +386,51 @@ impl App {
                 }
                 _ => {}
             },
-            Some(Screen::Run(run)) => match code {
-                KeyCode::Char('r') if !run.running => run.start_run(),
-                KeyCode::Esc | KeyCode::Char('q') if !run.running => {
-                    self.stack.pop();
-                    if self.stack.is_empty() {
-                        return true;
+            Some(Screen::Run(run)) => {
+                let nav = match code {
+                    KeyCode::Char('r') if !run.running => {
+                        run.start_run();
+                        None
                     }
-                }
-                _ => {}
-            },
-            Some(Screen::Browse(b)) => match code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    self.stack.pop();
-                    if self.stack.is_empty() {
-                        return true;
+                    KeyCode::Esc | KeyCode::Char('q') if !run.running => Some(NavAction::Pop),
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        run.select_prev();
+                        None
                     }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        run.select_next();
+                        None
+                    }
+                    KeyCode::Enter => {
+                        // Push an in-TUI ReportScreen for the highlighted
+                        // row. No browser, no external dependency — works
+                        // over SSH where xdg-open / `open` would fail.
+                        run.selected_result_path().map(NavAction::PushReport)
+                    }
+                    _ => None,
+                };
+                if let Some(action) = nav {
+                    self.apply_nav(action);
                 }
-                KeyCode::Up | KeyCode::Char('k') => b.select_prev(),
-                KeyCode::Down | KeyCode::Char('j') => b.select_next(),
-                KeyCode::Enter => b.open_selected(),
-                _ => {}
-            },
+            }
+            Some(Screen::Browse(b)) => {
+                let nav = match code {
+                    KeyCode::Esc | KeyCode::Char('q') => Some(NavAction::Pop),
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        b.select_prev();
+                        None
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        b.select_next();
+                        None
+                    }
+                    KeyCode::Enter => b.first_spec_result_path().map(NavAction::PushReport),
+                    _ => None,
+                };
+                if let Some(action) = nav {
+                    self.apply_nav(action);
+                }
+            }
             Some(Screen::Compare(c)) => match code {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     self.stack.pop();
@@ -417,10 +444,39 @@ impl App {
                 KeyCode::Char('c') | KeyCode::Enter => c.render_compare(),
                 _ => {}
             },
+            Some(Screen::Report(r)) => match code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.stack.pop();
+                    if self.stack.is_empty() {
+                        return true;
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => r.select_prev(),
+                KeyCode::Down | KeyCode::Char('j') => r.select_next(),
+                KeyCode::Char('b') | KeyCode::Char('B') => r.open_html(),
+                _ => {}
+            },
             None => return true,
         }
         false
     }
+
+    fn apply_nav(&mut self, action: NavAction) {
+        match action {
+            NavAction::Pop => {
+                self.stack.pop();
+            }
+            NavAction::PushReport(p) => {
+                use super::screens::ReportScreen;
+                self.stack.push(Screen::Report(ReportScreen::new(p)));
+            }
+        }
+    }
+}
+
+enum NavAction {
+    Pop,
+    PushReport(PathBuf),
 }
 
 fn default_results_root() -> PathBuf {
