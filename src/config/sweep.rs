@@ -43,6 +43,16 @@ impl AxisValue {
             _ => None,
         }
     }
+
+    /// Convert to a plain JSON number so the manifest serializes the same
+    /// raw integer value the Python implementation wrote.
+    pub fn to_json_value(&self) -> serde_json::Value {
+        match self {
+            AxisValue::Bytes(b) => serde_json::Value::Number((*b).into()),
+            AxisValue::Int(i) => serde_json::Value::Number((*i).into()),
+            AxisValue::Pct(p) => serde_json::Value::Number((*p).into()),
+        }
+    }
 }
 
 impl SweepPoint {

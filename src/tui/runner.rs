@@ -117,6 +117,11 @@ fn execute_inner(config: &Path, tx: &Sender<RunEvent>) -> Result<()> {
 
     let mut completed = 0;
     let mut failed = 0;
+    let mut manifest_entries: Vec<serde_json::Value> = Vec::new();
+    let mut manifest_statuses: serde_json::Map<String, serde_json::Value> = Default::default();
+    let manifest_run_id = ulid::Ulid::new().to_string();
+    let manifest_created = Utc::now();
+
     for (idx, (point, spec)) in pairs.iter().enumerate() {
         let sweep_label = point.as_ref().map(|p| p.short_label());
         let spec_dir = make_spec_dir(
@@ -152,13 +157,53 @@ fn execute_inner(config: &Path, tx: &Sender<RunEvent>) -> Result<()> {
             };
         let duration_s =
             (Utc::now() - started).num_milliseconds() as f64 / 1000.0;
+        let status_label = status.label();
         let _ = tx.send(RunEvent::SpecFinished {
             index: idx + 1,
             status,
             duration_s,
             report_path,
         });
+
+        let axis_values: Option<serde_json::Value> = point.as_ref().map(|p| {
+            let mut map = serde_json::Map::new();
+            for (k, v) in &p.overrides {
+                map.insert(k.clone(), v.to_json_value());
+            }
+            serde_json::Value::Object(map)
+        });
+        manifest_entries.push(serde_json::json!({
+            "index": idx + 1,
+            "spec_hash": spec.spec_hash,
+            "run_id": spec.run_id,
+            "target": spec.target_name(),
+            "workload": spec.workload.name,
+            "sweep": point.as_ref().map(|p| p.sweep_name.clone()),
+            "axis_values": axis_values,
+            "spec_dir": spec_dir
+                .strip_prefix(&run_dir)
+                .unwrap_or(&spec_dir)
+                .display()
+                .to_string(),
+        }));
+        manifest_statuses.insert(
+            spec.spec_hash.clone(),
+            serde_json::Value::String(status_label),
+        );
     }
+
+    let manifest = serde_json::json!({
+        "schema_version": "1.0",
+        "run_id": manifest_run_id,
+        "created_at": manifest_created.to_rfc3339(),
+        "run_specs": manifest_entries,
+        "statuses": manifest_statuses,
+    });
+    let _ = std::fs::write(
+        run_dir.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+    );
+
     let _ = tx.send(RunEvent::RunFinished {
         run_dir,
         completed,

@@ -135,6 +135,11 @@ fn run_command(config_path: &std::path::Path) -> Result<()> {
 
     let mut completed = 0usize;
     let mut failed = 0usize;
+    let mut manifest_entries: Vec<serde_json::Value> = Vec::new();
+    let mut manifest_statuses: serde_json::Map<String, serde_json::Value> = Default::default();
+    let manifest_run_id = ulid::Ulid::new().to_string();
+    let manifest_created = chrono::Utc::now();
+
     for (idx, (point, spec)) in pairs.iter().enumerate() {
         let sweep_label = point.as_ref().map(|p| p.short_label());
         let spec_dir = spec_dir_path(
@@ -156,6 +161,7 @@ fn run_command(config_path: &std::path::Path) -> Result<()> {
             label_extra,
             &spec.spec_hash[..18.min(spec.spec_hash.len())]
         );
+        let status_label;
         match crate::engine::run_spec(spec, &spec_dir, None, backend.as_ref()) {
             Ok(result) => {
                 write_result_json(&spec_dir, &result)?;
@@ -166,6 +172,7 @@ fn run_command(config_path: &std::path::Path) -> Result<()> {
                 if result.elbencho_exit_code == 0 {
                     println!("  ✓ result.json + report.html written");
                     completed += 1;
+                    status_label = "completed".to_string();
                 } else {
                     eprintln!(
                         "  ✗ {} exited {}; partial result written",
@@ -173,14 +180,59 @@ fn run_command(config_path: &std::path::Path) -> Result<()> {
                         result.elbencho_exit_code
                     );
                     failed += 1;
+                    status_label = format!("failed:{}", result.elbencho_exit_code);
                 }
             }
             Err(e) => {
                 eprintln!("  ✗ coordinator error: {:#}", e);
                 failed += 1;
+                status_label = "error".into();
             }
         }
+
+        // Manifest entry. axis_values format matches the Python schema so
+        // result.json files between Python and Rust runs are interchangeable.
+        let axis_values: Option<serde_json::Value> = point.as_ref().map(|p| {
+            let mut map = serde_json::Map::new();
+            for (k, v) in &p.overrides {
+                map.insert(k.clone(), v.to_json_value());
+            }
+            serde_json::Value::Object(map)
+        });
+        manifest_entries.push(serde_json::json!({
+            "index": idx + 1,
+            "spec_hash": spec.spec_hash,
+            "run_id": spec.run_id,
+            "target": spec.target_name(),
+            "workload": spec.workload.name,
+            "sweep": point.as_ref().map(|p| p.sweep_name.clone()),
+            "axis_values": axis_values,
+            "spec_dir": spec_dir
+                .strip_prefix(&run_dir)
+                .unwrap_or(&spec_dir)
+                .display()
+                .to_string(),
+        }));
+        manifest_statuses.insert(
+            spec.spec_hash.clone(),
+            serde_json::Value::String(status_label),
+        );
     }
+
+    // Write manifest.json (matches python-legacy/.../results/store.py shape so
+    // bench compare in either implementation can read it).
+    let manifest = serde_json::json!({
+        "schema_version": "1.0",
+        "run_id": manifest_run_id,
+        "created_at": manifest_created.to_rfc3339(),
+        "run_specs": manifest_entries,
+        "statuses": manifest_statuses,
+    });
+    std::fs::write(
+        run_dir.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest)?,
+    )?;
+
     println!(
         "\nDone. {} completed, {} failed. {}",
         completed,
