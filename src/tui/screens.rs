@@ -30,6 +30,7 @@ pub enum Screen {
     Browse(BrowseScreen),
     Compare(CompareScreen),
     Report(ReportScreen),
+    Compared(ComparedScreen),
 }
 
 // ---------------------------------------------------------------------------
@@ -1114,7 +1115,10 @@ impl CompareScreen {
         self.toggle_selected();
     }
 
-    pub fn render_compare(&mut self) {
+    /// Load the picked runs and build an in-TUI compare view. Returns
+    /// the new screen for the app to push. On error, sets `self.message`
+    /// and returns None so the user can fix selection and try again.
+    pub fn build_compared(&mut self) -> Option<ComparedScreen> {
         let picked: Vec<PathBuf> = self
             .runs
             .iter()
@@ -1122,32 +1126,18 @@ impl CompareScreen {
             .map(|r| r.path.clone())
             .collect();
         if picked.len() < 2 {
-            self.message = Some("Pick at least 2 runs.".into());
-            return;
+            self.message = Some("Pick at least 2 runs (space to toggle).".into());
+            return None;
         }
-        let loaded: Result<Vec<_>, _> = picked
+        let loaded: anyhow::Result<Vec<_>> = picked
             .iter()
             .map(|p| crate::report::load_run(p, None))
             .collect();
         match loaded {
-            Ok(runs) => {
-                let out = self.results_root.join(format!(
-                    "compare-{}-vs-{}.html",
-                    runs[0].label,
-                    runs[runs.len() - 1].label,
-                ));
-                match crate::report::render_compare(&runs, &out, None, "elmaestro compare") {
-                    Ok(_) => {
-                        open_in_browser(&out);
-                        self.message = Some(format!("Wrote {}", out.display()));
-                    }
-                    Err(e) => {
-                        self.message = Some(format!("Compare failed: {:#}", e));
-                    }
-                }
-            }
+            Ok(runs) => Some(ComparedScreen::new(runs, self.results_root.clone())),
             Err(e) => {
                 self.message = Some(format!("Failed to load runs: {:#}", e));
+                None
             }
         }
     }
@@ -1623,4 +1613,403 @@ fn human_bytes_u64(n: u64) -> String {
         }
     }
     format!("{} B", n)
+}
+
+// ---------------------------------------------------------------------------
+// Compared (in-TUI side-by-side comparison of N picked runs; replaces the
+// pre-v1.4.1 open-the-HTML-in-a-browser path that crashed over SSH)
+// ---------------------------------------------------------------------------
+
+/// One aligned spec row in the compared view. `per_run[i]` is the metrics
+/// from `runs[i]` for this (target, workload, axes) combination — `None`
+/// if that run has no matching spec.
+struct ComparedRow {
+    target: String,
+    workload: String,
+    axis_label: String,
+    per_run: Vec<Option<SpecMetrics>>,
+}
+
+pub struct ComparedScreen {
+    runs: Vec<crate::report::LoadedRun>,
+    rows: Vec<ComparedRow>,
+    state: ListState,
+    list_rect: Rect,
+    /// Where exported HTML lands. Set to the picked runs' parent dir so
+    /// the file ends up next to the runs it compares.
+    out_root: PathBuf,
+    message: Option<String>,
+}
+
+impl ComparedScreen {
+    pub fn new(runs: Vec<crate::report::LoadedRun>, out_root: PathBuf) -> Self {
+        let rows = build_compared_rows(&runs);
+        let mut state = ListState::default();
+        if !rows.is_empty() {
+            state.select(Some(0));
+        }
+        Self {
+            runs,
+            rows,
+            state,
+            list_rect: Rect::default(),
+            out_root,
+            message: None,
+        }
+    }
+
+    pub fn select_next(&mut self) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let i = self.state.selected().unwrap_or(0);
+        self.state.select(Some((i + 1) % self.rows.len()));
+    }
+
+    pub fn select_prev(&mut self) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let i = self.state.selected().unwrap_or(0);
+        self.state.select(Some((i + self.rows.len() - 1) % self.rows.len()));
+    }
+
+    pub fn click_at(&mut self, col: u16, row: u16) {
+        if !rect_contains(self.list_rect, col, row) {
+            return;
+        }
+        let idx = (row - self.list_rect.y) as usize;
+        if idx < self.rows.len() {
+            self.state.select(Some(idx));
+        }
+    }
+
+    /// Write a compare HTML file (same content as the old `compare`
+    /// subcommand) next to the run dirs. No browser opens — just shows
+    /// the destination path in the footer so the user can scp it back to
+    /// their laptop if they want the Plotly version.
+    pub fn export_html(&mut self) {
+        if self.runs.len() < 2 {
+            self.message = Some("Need at least 2 runs to export.".into());
+            return;
+        }
+        let first = &self.runs[0].label;
+        let last = &self.runs[self.runs.len() - 1].label;
+        let out = self.out_root.join(format!("compare-{}-vs-{}.html", first, last));
+        match crate::report::render_compare(&self.runs, &out, None, "elmaestro compare") {
+            Ok(_) => self.message = Some(format!("Wrote {}", out.display())),
+            Err(e) => self.message = Some(format!("Export failed: {:#}", e)),
+        }
+    }
+
+    /// Optional escape hatch: try to open the last exported HTML in a
+    /// browser. No-op on SSH hosts without DISPLAY (which is exactly why
+    /// the in-TUI view exists in the first place).
+    pub fn open_html(&mut self) {
+        if self.runs.len() < 2 {
+            self.message = Some("Need at least 2 runs to open.".into());
+            return;
+        }
+        let first = &self.runs[0].label;
+        let last = &self.runs[self.runs.len() - 1].label;
+        let out = self.out_root.join(format!("compare-{}-vs-{}.html", first, last));
+        if !out.is_file() {
+            // Render on the fly so 'b' before 'e' still works.
+            if let Err(e) =
+                crate::report::render_compare(&self.runs, &out, None, "elmaestro compare")
+            {
+                self.message = Some(format!("Render failed: {:#}", e));
+                return;
+            }
+        }
+        open_in_browser(&out);
+        self.message = Some(format!("Tried to open {} (no-op on SSH).", out.display()));
+    }
+
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+        let outer = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(
+                " Compare  ({} runs × {} specs) ",
+                self.runs.len(),
+                self.rows.len()
+            ))
+            .padding(Padding::horizontal(1));
+        let inner = outer.inner(area);
+        frame.render_widget(outer, area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(self.runs.len() as u16 + 2), // run legend
+                Constraint::Min(0),                              // body
+                Constraint::Length(1),                           // footer
+            ])
+            .split(inner);
+
+        self.render_legend(frame, chunks[0]);
+        self.render_body(frame, chunks[1]);
+        self.render_footer(frame, chunks[2]);
+    }
+
+    fn render_legend(&self, frame: &mut Frame, area: Rect) {
+        let mut lines = vec![Line::from(Span::styled(
+            "Runs being compared:",
+            Style::default().fg(Color::Rgb(0x58, 0xa6, 0xff)),
+        ))];
+        for (i, r) in self.runs.iter().enumerate() {
+            let tag = format!("  [{}] ", run_tag(i));
+            lines.push(Line::from(vec![
+                Span::styled(tag, Style::default().fg(run_color(i))),
+                Span::raw(r.label.clone()),
+            ]));
+        }
+        frame.render_widget(Paragraph::new(lines), area);
+    }
+
+    fn render_body(&mut self, frame: &mut Frame, area: Rect) {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .split(area);
+
+        // Left: list of aligned specs.
+        let items: Vec<ListItem> = self
+            .rows
+            .iter()
+            .map(|r| {
+                let label = if r.axis_label.is_empty() {
+                    format!("{} · {}", r.target, r.workload)
+                } else {
+                    format!("{} · {} · {}", r.target, r.workload, r.axis_label)
+                };
+                ListItem::new(label)
+            })
+            .collect();
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Specs (↑/↓ to cycle) "),
+            )
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(0x21, 0x26, 0x2d))
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶ ");
+        self.list_rect = cols[0];
+        frame.render_stateful_widget(list, cols[0], &mut self.state);
+
+        // Right: per-run bars for the highlighted spec.
+        self.render_detail_panel(frame, cols[1]);
+    }
+
+    fn render_detail_panel(&self, frame: &mut Frame, area: Rect) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Selected spec across runs ")
+            .padding(Padding::horizontal(1));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let Some(sel) = self.state.selected() else { return };
+        let Some(row) = self.rows.get(sel) else { return };
+
+        let sub = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(self.runs.len() as u16 + 2), // throughput block
+                Constraint::Length(self.runs.len() as u16 + 2), // iops block
+                Constraint::Min(self.runs.len() as u16 + 2),    // p95 block
+            ])
+            .split(inner);
+
+        self.render_metric_bars(
+            frame,
+            sub[0],
+            "Throughput",
+            row,
+            |m| m.throughput_mib_s,
+            format_throughput,
+        );
+        self.render_metric_bars(frame, sub[1], "IOPS", row, |m| m.iops, format_iops);
+        self.render_metric_bars(
+            frame,
+            sub[2],
+            "p95 latency",
+            row,
+            |m| m.lat_p95_us,
+            format_latency,
+        );
+    }
+
+    fn render_metric_bars(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        title: &str,
+        row: &ComparedRow,
+        pick: impl Fn(&SpecMetrics) -> Option<f64>,
+        fmt: fn(Option<f64>) -> String,
+    ) {
+        // Find the max value across runs for this metric to scale the bars.
+        let values: Vec<Option<f64>> = row
+            .per_run
+            .iter()
+            .map(|m| m.as_ref().and_then(&pick))
+            .collect();
+        let max = values
+            .iter()
+            .filter_map(|v| *v)
+            .fold(0.0_f64, f64::max)
+            .max(1.0);
+        let baseline = values.first().and_then(|v| *v);
+        let label_w = 5u16; // "[A] "
+        let value_w = 12u16; // " 3,975 MiB/s "
+        let delta_w = 12u16; // " (+12.3% )"
+        let bar_max = area.width.saturating_sub(label_w + value_w + delta_w + 2) as usize;
+
+        let mut lines: Vec<Line> = Vec::with_capacity(row.per_run.len() + 1);
+        lines.push(Line::from(Span::styled(
+            format!("{}", title),
+            Style::default()
+                .fg(Color::Rgb(0x8b, 0x94, 0x9e))
+                .add_modifier(Modifier::BOLD),
+        )));
+        for (i, v) in values.iter().enumerate() {
+            let bar_len = match v {
+                Some(x) => ((x / max).clamp(0.0, 1.0) * bar_max as f64).round() as usize,
+                None => 0,
+            };
+            let bar: String = "█".repeat(bar_len);
+            let value = fmt(*v);
+            let delta = match (baseline, v) {
+                (Some(b), Some(x)) if i > 0 && b.abs() > f64::EPSILON => {
+                    let pct = (x - b) / b * 100.0;
+                    let sign = if pct >= 0.0 { "+" } else { "" };
+                    format!(" ({}{:.1}%)", sign, pct)
+                }
+                _ => String::new(),
+            };
+            // Latency improves when lower; color delta accordingly.
+            let delta_style = if delta.is_empty() {
+                Style::default().fg(Color::Rgb(0x8b, 0x94, 0x9e))
+            } else {
+                let is_latency = title.contains("lat");
+                let positive = delta.contains("+");
+                let good = (positive && !is_latency) || (!positive && is_latency);
+                Style::default().fg(if good {
+                    Color::Rgb(0x3f, 0xb9, 0x50)
+                } else {
+                    Color::Rgb(0xf8, 0x51, 0x49)
+                })
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("[{}] ", run_tag(i)),
+                    Style::default().fg(run_color(i)),
+                ),
+                Span::styled(bar, Style::default().fg(run_color(i))),
+                Span::raw(format!(" {:>10}", value)),
+                Span::styled(delta, delta_style),
+            ]));
+        }
+        frame.render_widget(Paragraph::new(lines), area);
+    }
+
+    fn render_footer(&self, frame: &mut Frame, area: Rect) {
+        let msg = self.message.clone().unwrap_or_else(|| {
+            "[↑/↓] cycle specs · [e] export HTML · [b] open in browser · [esc] back".into()
+        });
+        let style = if self.message.is_some() {
+            Style::default().fg(Color::Rgb(0x3f, 0xb9, 0x50))
+        } else {
+            Style::default().fg(Color::Rgb(0x8b, 0x94, 0x9e))
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(msg, style)),
+            area,
+        );
+    }
+}
+
+/// Align specs across N runs by (target, workload, axes). One ComparedRow
+/// per unique spec key; per_run[i] is None if that run has no matching
+/// spec. Order is determined by the first run that mentioned the key, so
+/// the display order matches the baseline run.
+fn build_compared_rows(runs: &[crate::report::LoadedRun]) -> Vec<ComparedRow> {
+    use std::collections::HashMap;
+    // We need ordered insertion. IndexMap would be ideal here, but reaching
+    // for it isn't necessary — track first-seen index manually.
+    let mut order: Vec<(String, String, String)> = Vec::new();
+    let mut by_key: HashMap<(String, String, String), Vec<Option<SpecMetrics>>> =
+        HashMap::new();
+
+    for (run_idx, run) in runs.iter().enumerate() {
+        for rwa in &run.results {
+            let axis_label = match &rwa.axes {
+                Some(m) if !m.is_empty() => {
+                    let mut parts: Vec<(String, &serde_json::Value)> =
+                        m.iter().map(|(k, v)| (k.clone(), v)).collect();
+                    parts.sort_by(|a, b| a.0.cmp(&b.0));
+                    parts
+                        .into_iter()
+                        .map(|(k, v)| match v {
+                            serde_json::Value::String(s) => format!("{}={}", k, s),
+                            other => format!("{}={}", k, other),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+                _ => String::new(),
+            };
+            let key = (
+                rwa.result.target.name.clone(),
+                rwa.result.workload.name.clone(),
+                axis_label.clone(),
+            );
+            let slot = by_key.entry(key.clone()).or_insert_with(|| {
+                order.push(key.clone());
+                vec![None; runs.len()]
+            });
+            slot[run_idx] = Some(SpecMetrics::from_result(&rwa.result));
+        }
+    }
+
+    order
+        .into_iter()
+        .map(|k| {
+            let per_run = by_key.remove(&k).unwrap_or_else(|| vec![None; runs.len()]);
+            ComparedRow {
+                target: k.0,
+                workload: k.1,
+                axis_label: k.2,
+                per_run,
+            }
+        })
+        .collect()
+}
+
+/// Two-letter tags ([A], [B], ... [Z], then [AA]+) for the run legend.
+fn run_tag(i: usize) -> String {
+    if i < 26 {
+        ((b'A' + i as u8) as char).to_string()
+    } else {
+        format!("{}", i + 1)
+    }
+}
+
+/// Distinct colors for up to ~6 runs. Colors past that wrap.
+fn run_color(i: usize) -> Color {
+    const PALETTE: &[(u8, u8, u8)] = &[
+        (0x58, 0xa6, 0xff), // blue
+        (0x3f, 0xb9, 0x50), // green
+        (0xd2, 0x99, 0x22), // amber
+        (0xb1, 0x86, 0xff), // purple
+        (0xf8, 0x51, 0x49), // red
+        (0x39, 0xc5, 0xcf), // cyan
+    ];
+    let (r, g, b) = PALETTE[i % PALETTE.len()];
+    Color::Rgb(r, g, b)
 }

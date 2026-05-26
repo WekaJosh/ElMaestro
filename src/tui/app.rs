@@ -170,6 +170,7 @@ impl App {
                         Screen::Browse(s) => s.render(frame, area),
                         Screen::Compare(s) => s.render(frame, area),
                         Screen::Report(s) => s.render(frame, area),
+                        Screen::Compared(s) => s.render(frame, area),
                     }
                 }
             })?;
@@ -289,7 +290,10 @@ impl App {
             Some(Screen::Compare(c)) => {
                 c.click_at(col, row);
             }
-            Some(Screen::Run(_)) | Some(Screen::Report(_)) | None => {}
+            Some(Screen::Run(_))
+            | Some(Screen::Report(_))
+            | Some(Screen::Compared(_))
+            | None => {}
         }
         false
     }
@@ -431,19 +435,30 @@ impl App {
                     self.apply_nav(action);
                 }
             }
-            Some(Screen::Compare(c)) => match code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    self.stack.pop();
-                    if self.stack.is_empty() {
-                        return true;
+            Some(Screen::Compare(c)) => {
+                let nav = match code {
+                    KeyCode::Esc | KeyCode::Char('q') => Some(NavAction::Pop),
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        c.select_prev();
+                        None
                     }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        c.select_next();
+                        None
+                    }
+                    KeyCode::Char(' ') => {
+                        c.toggle_selected();
+                        None
+                    }
+                    KeyCode::Char('c') | KeyCode::Enter => {
+                        c.build_compared().map(NavAction::PushCompared)
+                    }
+                    _ => None,
+                };
+                if let Some(action) = nav {
+                    self.apply_nav(action);
                 }
-                KeyCode::Up | KeyCode::Char('k') => c.select_prev(),
-                KeyCode::Down | KeyCode::Char('j') => c.select_next(),
-                KeyCode::Char(' ') => c.toggle_selected(),
-                KeyCode::Char('c') | KeyCode::Enter => c.render_compare(),
-                _ => {}
-            },
+            }
             Some(Screen::Report(r)) => match code {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     self.stack.pop();
@@ -454,6 +469,19 @@ impl App {
                 KeyCode::Up | KeyCode::Char('k') => r.select_prev(),
                 KeyCode::Down | KeyCode::Char('j') => r.select_next(),
                 KeyCode::Char('b') | KeyCode::Char('B') => r.open_html(),
+                _ => {}
+            },
+            Some(Screen::Compared(c)) => match code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.stack.pop();
+                    if self.stack.is_empty() {
+                        return true;
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => c.select_prev(),
+                KeyCode::Down | KeyCode::Char('j') => c.select_next(),
+                KeyCode::Char('e') | KeyCode::Char('E') => c.export_html(),
+                KeyCode::Char('b') | KeyCode::Char('B') => c.open_html(),
                 _ => {}
             },
             None => return true,
@@ -470,6 +498,9 @@ impl App {
                 use super::screens::ReportScreen;
                 self.stack.push(Screen::Report(ReportScreen::new(p)));
             }
+            NavAction::PushCompared(c) => {
+                self.stack.push(Screen::Compared(c));
+            }
         }
     }
 }
@@ -477,6 +508,7 @@ impl App {
 enum NavAction {
     Pop,
     PushReport(PathBuf),
+    PushCompared(super::screens::ComparedScreen),
 }
 
 fn default_results_root() -> PathBuf {
