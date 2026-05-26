@@ -4,12 +4,7 @@ Interactive IO benchmarking harness. Drives [elbencho](https://github.com/breune
 
 ## Status
 
-**v1.0.0.** Rust rewrite of the original Python harness. Same feature set (engines, sweeps, resume, SSH fan-out, compare reports, TUI), 16x smaller binary, much faster startup. Python source preserved under `python-legacy/` for reference; see [docs/BINARY_SIZE.md](./docs/BINARY_SIZE.md) for the rewrite rationale.
-
-| Build | macOS arm64 | Linux x86_64 |
-|---|---|---|
-| Python v0.9.0 (PyInstaller) | 33.5 MB | 33.1 MB |
-| **Rust v1.0.0** | **2.1 MB** | **2.9 MB** |
+**v1.0.0.** Local POSIX, S3 targets (elbencho), multi-client SSH fan-out, sweep expansion (cartesian / ladder), compare reports, Textual-style TUI. Single-file binary, 2-3 MB depending on platform.
 
 ## Install
 
@@ -88,10 +83,6 @@ cd ElMaestro
 cargo build --release
 # Output: target/release/elmaestro
 ```
-
-## Why the rewrite?
-
-The original Python implementation (preserved under `python-legacy/`) shipped a 33 MB PyInstaller binary that bundled the Python interpreter, plotly, pydantic, textual, and asyncssh + cryptography + OpenSSL. The Rust rewrite drops it to 2-3 MB with zero feature loss. See [docs/BINARY_SIZE.md](./docs/BINARY_SIZE.md) for the full analysis including realistic targets for every other commonly-used language.
 
 ## Roadmap
 
