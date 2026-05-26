@@ -1,8 +1,4 @@
 //! Event-driven runner the TUI reads from in a background thread.
-//!
-//! Mirrors python-legacy/src/elbencho_harness/tui/runner.py: yields one
-//! event per phase / per spec as the benchmark walks the config's
-//! materialized (SweepPoint, RunSpec) pairs.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
@@ -11,7 +7,7 @@ use anyhow::Result;
 use chrono::Utc;
 
 use crate::backends::get_backend;
-use crate::config::{loader, sweep, RunSpec};
+use crate::config::{loader, sweep, RunPlan, RunSpec};
 
 #[derive(Debug, Clone)]
 pub enum RunEvent {
@@ -62,19 +58,45 @@ impl SpecStatus {
     }
 }
 
-/// Walk a config end-to-end, posting events to the channel. Designed to run
-/// in a background thread spawned from the TUI app.
+/// Execute a config file. Single iteration of the sweep.
 pub fn execute(config: &Path, tx: Sender<RunEvent>) {
-    if let Err(e) = execute_inner(config, &tx) {
-        let _ = tx.send(RunEvent::Crashed {
-            message: format!("{:#}", e),
-        });
+    let plan = match loader::load(config) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = tx.send(RunEvent::Crashed {
+                message: format!("{:#}", e),
+            });
+            return;
+        }
+    };
+    let label = config
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "run".into());
+    execute_plan(plan, &label, 1, tx);
+}
+
+/// Execute an in-memory RunPlan, optionally repeating the whole sweep N times
+/// for variance analysis. Each repetition lands in its own run directory.
+pub fn execute_plan(plan: RunPlan, label: &str, repeats: usize, tx: Sender<RunEvent>) {
+    let repeats = repeats.max(1);
+    for iter in 0..repeats {
+        let iter_label = if repeats > 1 {
+            format!("{}_run{:02}", label, iter + 1)
+        } else {
+            label.to_string()
+        };
+        if let Err(e) = execute_one_iteration(&plan, &iter_label, &tx) {
+            let _ = tx.send(RunEvent::Crashed {
+                message: format!("{:#}", e),
+            });
+            return;
+        }
     }
 }
 
-fn execute_inner(config: &Path, tx: &Sender<RunEvent>) -> Result<()> {
-    let plan = loader::load(config)?;
-    let pairs = sweep::materialize_run_refs(&plan)?;
+fn execute_one_iteration(plan: &RunPlan, label: &str, tx: &Sender<RunEvent>) -> Result<()> {
+    let pairs = sweep::materialize_run_refs(plan)?;
     if pairs.is_empty() {
         anyhow::bail!("config has neither `runs:` nor `sweeps:` to execute");
     }
@@ -82,12 +104,8 @@ fn execute_inner(config: &Path, tx: &Sender<RunEvent>) -> Result<()> {
     let base_out = plan.output_dir.clone();
     std::fs::create_dir_all(&base_out)?;
 
-    let first_label = match &pairs[0].0 {
-        Some(point) => format!("sweep_{}", point.sweep_name),
-        None => format!("{}_{}", pairs[0].1.target_name(), pairs[0].1.workload.name),
-    };
     let ts = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
-    let slug = first_label
+    let slug = label
         .chars()
         .map(|c| {
             if c.is_alphanumeric() || matches!(c, '.' | '_' | '-') {
@@ -155,8 +173,7 @@ fn execute_inner(config: &Path, tx: &Sender<RunEvent>) -> Result<()> {
                     (SpecStatus::Error, None)
                 }
             };
-        let duration_s =
-            (Utc::now() - started).num_milliseconds() as f64 / 1000.0;
+        let duration_s = (Utc::now() - started).num_milliseconds() as f64 / 1000.0;
         let status_label = status.label();
         let _ = tx.send(RunEvent::SpecFinished {
             index: idx + 1,
@@ -242,9 +259,13 @@ fn make_spec_dir(
     Ok(dir)
 }
 
-/// Dry-load a config and return its expanded (SweepPoint, RunSpec) pairs.
-/// Used by the RunScreen to populate the table before launching.
+/// Dry-load a config file and return its expanded pairs.
 pub fn plan_pairs(config: &Path) -> Result<Vec<(Option<sweep::SweepPoint>, RunSpec)>> {
     let plan = loader::load(config)?;
     sweep::materialize_run_refs(&plan)
+}
+
+/// Expand an in-memory plan (used by the configure-screen flow).
+pub fn plan_pairs_from(plan: &RunPlan) -> Result<Vec<(Option<sweep::SweepPoint>, RunSpec)>> {
+    sweep::materialize_run_refs(plan)
 }

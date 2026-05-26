@@ -24,6 +24,7 @@ use super::runner::{plan_pairs, RunEvent};
 /// Top-level screen identity. Screens are stack-pushed via App::push.
 pub enum Screen {
     Home(HomeScreen),
+    Configure(super::configure::ConfigureScreen),
     PickConfigForRun(PickConfigScreen),
     Run(RunScreen),
     Browse(BrowseScreen),
@@ -35,7 +36,8 @@ pub enum Screen {
 // ---------------------------------------------------------------------------
 
 const HOME_ITEMS: &[&str] = &[
-    "Run a benchmark",
+    "Configure & run a benchmark",
+    "Open an existing YAML config",
     "Browse past results",
     "Compare runs",
     "Quit",
@@ -101,16 +103,18 @@ impl HomeScreen {
 
     pub fn selected_action(&self) -> HomeAction {
         match self.state.selected().unwrap_or(0) {
-            0 => HomeAction::Run,
-            1 => HomeAction::Browse,
-            2 => HomeAction::Compare,
+            0 => HomeAction::Configure,
+            1 => HomeAction::PickYaml,
+            2 => HomeAction::Browse,
+            3 => HomeAction::Compare,
             _ => HomeAction::Quit,
         }
     }
 }
 
 pub enum HomeAction {
-    Run,
+    Configure,
+    PickYaml,
     Browse,
     Compare,
     Quit,
@@ -282,8 +286,17 @@ impl PickConfigScreen {
 // Run screen
 // ---------------------------------------------------------------------------
 
+pub enum RunSource {
+    Config(PathBuf),
+    Plan {
+        plan: crate::config::RunPlan,
+        label: String,
+        repeats: usize,
+    },
+}
+
 pub struct RunScreen {
-    pub config: PathBuf,
+    pub source: RunSource,
     pub status_text: String,
     pub rows: Vec<RowState>,
     pub table_state: TableState,
@@ -304,7 +317,7 @@ pub struct RowState {
 impl RunScreen {
     pub fn new(config: PathBuf) -> Self {
         let mut screen = Self {
-            config,
+            source: RunSource::Config(config.clone()),
             status_text: String::new(),
             rows: Vec::new(),
             table_state: TableState::default(),
@@ -312,23 +325,13 @@ impl RunScreen {
             rx: None,
             finished: false,
         };
-        match plan_pairs(&screen.config) {
+        match plan_pairs(&config) {
             Ok(pairs) => {
-                for (idx, (point, spec)) in pairs.iter().enumerate() {
-                    let axis_label = point.as_ref().map(|p| p.short_label()).unwrap_or_default();
-                    screen.rows.push(RowState {
-                        idx: idx + 1,
-                        target: spec.target_name().into(),
-                        workload: spec.workload.name.clone(),
-                        axis_label,
-                        status: "queued".into(),
-                        duration: String::new(),
-                    });
-                }
+                screen.populate_rows(&pairs);
                 screen.status_text = format!(
                     "Loaded {} spec(s) from {}. Press [r] to run, [esc] back.",
                     screen.rows.len(),
-                    screen.config.display(),
+                    config.display(),
                 );
             }
             Err(e) => {
@@ -336,6 +339,59 @@ impl RunScreen {
             }
         }
         screen
+    }
+
+    /// Build a RunScreen from an in-memory plan (Configure flow).
+    pub fn from_plan(plan: crate::config::RunPlan, label: String, repeats: usize) -> Self {
+        let mut screen = Self {
+            source: RunSource::Plan {
+                plan: plan.clone(),
+                label,
+                repeats,
+            },
+            status_text: String::new(),
+            rows: Vec::new(),
+            table_state: TableState::default(),
+            running: false,
+            rx: None,
+            finished: false,
+        };
+        match super::runner::plan_pairs_from(&plan) {
+            Ok(pairs) => {
+                screen.populate_rows(&pairs);
+                let suffix = if repeats > 1 {
+                    format!(" × {} runs", repeats)
+                } else {
+                    String::new()
+                };
+                screen.status_text = format!(
+                    "Configured {} spec(s){}. Press [r] to run, [esc] back.",
+                    screen.rows.len(),
+                    suffix
+                );
+            }
+            Err(e) => {
+                screen.status_text = format!("Plan invalid: {:#}", e);
+            }
+        }
+        screen
+    }
+
+    fn populate_rows(
+        &mut self,
+        pairs: &[(Option<crate::config::sweep::SweepPoint>, crate::config::RunSpec)],
+    ) {
+        for (idx, (point, spec)) in pairs.iter().enumerate() {
+            let axis_label = point.as_ref().map(|p| p.short_label()).unwrap_or_default();
+            self.rows.push(RowState {
+                idx: idx + 1,
+                target: spec.target_name().into(),
+                workload: spec.workload.name.clone(),
+                axis_label,
+                status: "queued".into(),
+                duration: String::new(),
+            });
+        }
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
@@ -426,8 +482,24 @@ impl RunScreen {
         self.running = true;
         self.status_text = "Running…".into();
         let (tx, rx): (Sender<RunEvent>, Receiver<RunEvent>) = std::sync::mpsc::channel();
-        let cfg = self.config.clone();
-        std::thread::spawn(move || super::runner::execute(&cfg, tx));
+        match &self.source {
+            RunSource::Config(path) => {
+                let cfg = path.clone();
+                std::thread::spawn(move || super::runner::execute(&cfg, tx));
+            }
+            RunSource::Plan {
+                plan,
+                label,
+                repeats,
+            } => {
+                let plan = plan.clone();
+                let label = label.clone();
+                let repeats = *repeats;
+                std::thread::spawn(move || {
+                    super::runner::execute_plan(plan, &label, repeats, tx)
+                });
+            }
+        }
         self.rx = Some(rx);
     }
 

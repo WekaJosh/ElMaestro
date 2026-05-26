@@ -9,6 +9,6 @@ pub mod models;
 pub mod sweep;
 
 pub use models::{
-    ByteSize, ClientHost, Engine, PosixTarget, RunPlan, RunRef, RunSpec, S3Target, Sweep,
-    SweepAxis, Target, Workload,
+    parse_bytesize_string, ByteSize, ClientHost, Engine, PosixTarget, RunPlan, RunRef, RunSpec,
+    S3Target, Sweep, SweepAxis, Target, Workload,
 };

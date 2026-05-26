@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -15,6 +15,7 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
+use super::configure::ConfigureScreen;
 use super::screens::{
     BrowseScreen, CompareScreen, HomeAction, HomeScreen, PickConfigScreen, RunScreen, Screen,
 };
@@ -35,10 +36,11 @@ impl App {
     }
 
     pub fn run(&mut self) -> Result<()> {
-        // Init terminal.
+        // Init terminal. NO mouse capture: must work in tmux/screen
+        // sessions where mouse support is unavailable.
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        execute!(stdout, EnterAlternateScreen)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
@@ -46,7 +48,7 @@ impl App {
 
         // Restore terminal regardless of how we exit.
         disable_raw_mode().ok();
-        execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture).ok();
+        execute!(io::stdout(), LeaveAlternateScreen).ok();
         terminal.show_cursor().ok();
         result
     }
@@ -66,6 +68,7 @@ impl App {
                 if let Some(top) = self.stack.last_mut() {
                     match top {
                         Screen::Home(s) => s.render(frame, area),
+                        Screen::Configure(s) => s.render(frame, area),
                         Screen::PickConfigForRun(s) => s.render(frame, area),
                         Screen::Run(s) => s.render(frame, area),
                         Screen::Browse(s) => s.render(frame, area),
@@ -100,7 +103,10 @@ impl App {
                 KeyCode::Up | KeyCode::Char('k') => home.select_prev(),
                 KeyCode::Down | KeyCode::Char('j') => home.select_next(),
                 KeyCode::Enter => match home.selected_action() {
-                    HomeAction::Run => {
+                    HomeAction::Configure => {
+                        self.stack.push(Screen::Configure(ConfigureScreen::new()));
+                    }
+                    HomeAction::PickYaml => {
                         let start = std::env::current_dir()
                             .unwrap_or_else(|_| PathBuf::from("."));
                         self.stack
@@ -118,6 +124,49 @@ impl App {
                 },
                 _ => {}
             },
+            Some(Screen::Configure(form)) => {
+                // Check for the user pressing Run / Cancel before reading
+                // for ordinary nav keys.
+                if form.cancelled {
+                    self.stack.pop();
+                    if self.stack.is_empty() {
+                        return true;
+                    }
+                    return false;
+                }
+                if let Some((plan, label, repeats)) = form.built_plan.take() {
+                    self.stack.pop();
+                    self.stack
+                        .push(Screen::Run(RunScreen::from_plan(plan, label, repeats)));
+                    return false;
+                }
+                match code {
+                    KeyCode::Esc => {
+                        self.stack.pop();
+                        if self.stack.is_empty() {
+                            return true;
+                        }
+                    }
+                    KeyCode::Tab | KeyCode::Down => form.focus_next(),
+                    KeyCode::BackTab | KeyCode::Up => form.focus_prev(),
+                    KeyCode::Right => form.nudge_right(),
+                    KeyCode::Left => form.nudge_left(),
+                    KeyCode::Home => form.home(),
+                    KeyCode::End => form.end(),
+                    KeyCode::Backspace => form.backspace(),
+                    KeyCode::Delete => form.delete(),
+                    KeyCode::Enter => form.activate(),
+                    KeyCode::Char(' ') => {
+                        if form.is_text_focused() {
+                            form.insert_char(' ');
+                        } else {
+                            form.activate();
+                        }
+                    }
+                    KeyCode::Char(c) => form.insert_char(c),
+                    _ => {}
+                }
+            }
             Some(Screen::PickConfigForRun(picker)) => match code {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     self.stack.pop();
