@@ -1,6 +1,6 @@
 //! Sweep -> list[(SweepPoint, RunSpec)] expansion.
 //!
-//! Mirrors python-legacy/src/elbencho_harness/config/sweep.py. Two orders:
+//! Two orders:
 //!
 //!   cartesian: full cross-product of populated axes
 //!   ladder:    vary one axis at a time, holding others at workload defaults

@@ -539,9 +539,9 @@ mod tests {
     fn parse_results_strips_client_server_preamble() {
         let tmp = TempDir::new().unwrap();
         let body = format!(
-            "<weka54> seq-read-base: (g=0): rw=read\n\
-             <weka54> Starting 8 processes\n\
-             <weka54> seq-read-base:\n{}",
+            "<worker01> seq-read-base: (g=0): rw=read\n\
+             <worker01> Starting 8 processes\n\
+             <worker01> seq-read-base:\n{}",
             serde_json::to_string(&sample_json_pure_read()).unwrap()
         );
         std::fs::write(tmp.path().join("run.json"), body).unwrap();

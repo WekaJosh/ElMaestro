@@ -1,6 +1,6 @@
 //! Main ratatui App + event loop.
 //!
-//! Screen-stack pattern matching python-legacy/src/.../tui/app.py.
+//! Screen-stack pattern: push/pop screens as the user navigates.
 
 use std::io;
 use std::path::PathBuf;

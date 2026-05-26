@@ -1,8 +1,8 @@
 //! Compare report rendering (multi-run overlay).
 //!
-//! Mirrors python-legacy/src/.../report/compare.py. Loads N run directories
-//! from disk, aligns specs by (target, workload, axis_values), emits one
-//! HTML with three overlay charts + a diff table vs baseline.
+//! Loads N run directories from disk, aligns specs by (target, workload,
+//! axis_values), emits one HTML with three overlay charts + a diff table
+//! vs baseline.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

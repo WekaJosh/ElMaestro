@@ -1,6 +1,6 @@
-//! Canonical config models. Mirrors python-legacy/src/.../config/models.py.
+//! Canonical config models.
 //!
-//! Single source of truth for YAML and (future) TUI editor. Uses serde for
+//! Single source of truth for YAML and the TUI editor. Uses serde for
 //! parsing + validation. ByteSize accepts both integers and human-readable
 //! strings ("1MiB", "4k") thanks to a custom Deserialize impl.
 

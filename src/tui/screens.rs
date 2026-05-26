@@ -1,4 +1,4 @@
-//! ratatui Screens. Mirrors python-legacy/src/.../tui/screens.py.
+//! ratatui Screens.
 //!
 //! Five screens:
 //!   - Home          main menu (Run / Browse / Compare / Quit)

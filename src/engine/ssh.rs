@@ -1,7 +1,6 @@
 //! SSH layer built on the system `ssh(1)` binary.
 //!
-//! Mirrors python-legacy/src/elbencho_harness/engine/ssh.py (v0.9, the
-//! subprocess-based rewrite that dropped asyncssh). Same lifecycle:
+//! Lifecycle:
 //!   - start_background spawns a remote `nohup <cmd> > log 2>&1 &` with a
 //!     PID file written to /tmp/elmaestro-<marker>.pid
 //!   - close()/stop_background kills via `kill $(cat pid_file)` and cleans up

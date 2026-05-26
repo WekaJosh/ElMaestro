@@ -1,6 +1,5 @@
-//! Single-spec report rendering.
-//!
-//! Mirrors python-legacy/src/.../report/render.py + charts.py headline tiles.
+//! Single-spec report rendering. Builds headline tiles + Plotly.js JSON
+//! and renders into the askama single.html template.
 
 use std::path::Path;
 

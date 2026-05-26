@@ -219,8 +219,7 @@ fn run_command(config_path: &std::path::Path) -> Result<()> {
         );
     }
 
-    // Write manifest.json (matches python-legacy/.../results/store.py shape so
-    // bench compare in either implementation can read it).
+    // Write manifest.json so compare reports can align specs across runs.
     let manifest = serde_json::json!({
         "schema_version": "1.0",
         "run_id": manifest_run_id,

@@ -1,7 +1,6 @@
 //! YAML loader with placeholder substitution.
 //!
-//! Mirrors python-legacy/src/elbencho_harness/config/loader.py. Three
-//! placeholders are expanded textually before YAML parses:
+//! Three placeholders are expanded textually before YAML parses:
 //!
 //!   ${CONFIG_DIR}   absolute directory of the YAML file being loaded
 //!   ${HOME}         user's home directory
