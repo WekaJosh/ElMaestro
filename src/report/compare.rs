@@ -106,6 +106,7 @@ pub fn load_run(run_dir: &Path, label: Option<&str>) -> Result<LoadedRun> {
 
 #[derive(Debug)]
 struct CompareRow {
+    #[allow(dead_code)]
     spec_key: (String, String, Vec<(String, serde_json::Value)>),
     target: String,
     workload: String,
