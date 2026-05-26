@@ -55,6 +55,11 @@ pub struct ClientHost {
     pub ssh_port: u16,
     #[serde(default)]
     pub ssh_key: Option<PathBuf>,
+    /// Optional jump host (ssh -J). Lets a user on their laptop reach
+    /// internal workers via a bastion. Accepts `host`, `user@host`,
+    /// or `user@host:port`.
+    #[serde(default)]
+    pub ssh_jump: Option<String>,
     /// Path to the engine binary on this client (historical name; works
     /// for both elbencho and fio).
     #[serde(default = "default_engine_path")]
@@ -70,6 +75,7 @@ impl Default for ClientHost {
             ssh_user: None,
             ssh_port: default_ssh_port(),
             ssh_key: None,
+            ssh_jump: None,
             elbencho_path: default_engine_path(),
             service_port: default_service_port(),
         }

@@ -2,13 +2,16 @@
 //!
 //! Screen-stack pattern: push/pop screens as the user navigates.
 
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Once;
 use std::time::Duration;
 
 use anyhow::Result;
+use crossterm::cursor::Show as ShowCursor;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -21,6 +24,64 @@ use super::configure::ConfigureScreen;
 use super::screens::{
     BrowseScreen, CompareScreen, HomeAction, HomeScreen, PickConfigScreen, RunScreen, Screen,
 };
+
+/// Set to `true` while the terminal is in raw mode + alt-screen + mouse
+/// capture. Used by both the Drop guard and the panic hook so cleanup is
+/// idempotent and doesn't fire on terminals we never touched.
+static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
+static INSTALL_HOOK_ONCE: Once = Once::new();
+
+/// Owns the terminal state during the TUI. Restores raw mode, the alt
+/// screen, and mouse capture on Drop. A panic hook is also installed once
+/// per process: `panic = "abort"` in the release profile skips Drop on
+/// panic, and without the hook the shell ends up stuck in mouse-tracking
+/// mode after a crash (every keypress / mouse motion splatters SGR
+/// escape sequences like "35;146;27M..." into the prompt).
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn install() -> Result<Self> {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        let _ = stdout.flush();
+        TERMINAL_ACTIVE.store(true, Ordering::SeqCst);
+
+        INSTALL_HOOK_ONCE.call_once(|| {
+            let original = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                Self::cleanup();
+                original(info);
+            }));
+        });
+
+        Ok(TerminalGuard)
+    }
+
+    /// Idempotent: only emits restore sequences if we actually entered raw
+    /// mode. Safe to call from both Drop and the panic hook without double
+    /// cleanup.
+    fn cleanup() {
+        if !TERMINAL_ACTIVE.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = execute!(
+            stdout,
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            ShowCursor,
+        );
+        let _ = stdout.flush();
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        Self::cleanup();
+    }
+}
 
 pub struct App {
     stack: Vec<Screen>,
@@ -38,21 +99,19 @@ impl App {
     }
 
     pub fn run(&mut self) -> Result<()> {
-        // Init terminal. Mouse capture is enabled (works in any terminal
-        // that supports it); keyboard navigation works regardless, so this
-        // is no-loss in tmux/screen sessions that don't pass mouse events.
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-        let backend = CrosstermBackend::new(stdout);
+        // Mouse capture is enabled (works in any terminal that supports it);
+        // keyboard navigation works regardless, so this is no-loss in
+        // tmux/screen sessions that don't pass mouse events.
+        let _guard = TerminalGuard::install()?;
+        let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::new(backend)?;
 
         let result = self.event_loop(&mut terminal);
 
-        // Restore terminal regardless of how we exit.
-        disable_raw_mode().ok();
-        execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture).ok();
-        terminal.show_cursor().ok();
+        // _guard's Drop runs here and restores the terminal. We deliberately
+        // do not swallow that cleanup with `.ok()` anywhere; if Drop fails it
+        // crashes loudly rather than leaking mouse-tracking into the shell.
+        drop(_guard);
         result
     }
 
@@ -87,6 +146,26 @@ impl App {
                     Event::Key(key) => {
                         if key.kind != KeyEventKind::Press {
                             continue;
+                        }
+                        // Ctrl+S / Ctrl+L are template hotkeys for the
+                        // Configure screen. Intercept before normal dispatch
+                        // so 's' / 'l' still work as text input on text fields.
+                        if key.modifiers.contains(KeyModifiers::CONTROL) {
+                            if let Some(Screen::Configure(form)) =
+                                self.stack.last_mut()
+                            {
+                                match key.code {
+                                    KeyCode::Char('s') | KeyCode::Char('S') => {
+                                        form.save_template();
+                                        continue;
+                                    }
+                                    KeyCode::Char('l') | KeyCode::Char('L') => {
+                                        form.load_template();
+                                        continue;
+                                    }
+                                    _ => {}
+                                }
+                            }
                         }
                         if self.handle_key(key.code) {
                             return Ok(());

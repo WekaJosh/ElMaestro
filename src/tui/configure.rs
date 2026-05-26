@@ -49,6 +49,8 @@ enum Field {
 enum ButtonAction {
     Run,
     Cancel,
+    SaveTemplate,
+    LoadTemplate,
 }
 
 impl Field {
@@ -178,6 +180,8 @@ pub struct ConfigureScreen {
     fields: Vec<Field>,
     focused: usize,
     pub error: Option<String>,
+    /// Green success message shown in the footer. Used by save/load.
+    pub notice: Option<String>,
     /// Set when the user activates the Run button. The app drains this to
     /// transition to a RunScreen.
     pub built_plan: Option<(RunPlan, String, usize)>,
@@ -193,6 +197,7 @@ impl ConfigureScreen {
             fields: default_fields(),
             focused: 0,
             error: None,
+            notice: None,
             built_plan: None,
             cancelled: false,
             body_rect: ratatui::layout::Rect::default(),
@@ -239,15 +244,21 @@ impl ConfigureScreen {
         self.body_rect = inner_area;
         frame.render_widget(body, inner_area);
 
-        let footer_text = match &self.error {
-            Some(e) => Line::from(Span::styled(
+        let footer_text = if let Some(e) = &self.error {
+            Line::from(Span::styled(
                 e.clone(),
                 Style::default().fg(Color::Rgb(0xf8, 0x51, 0x49)),
-            )),
-            None => Line::from(Span::styled(
-                "Comma-separate sweep values, e.g. block_size = 64k,256k,1m,4m",
+            ))
+        } else if let Some(n) = &self.notice {
+            Line::from(Span::styled(
+                n.clone(),
+                Style::default().fg(Color::Rgb(0x3f, 0xb9, 0x50)),
+            ))
+        } else {
+            Line::from(Span::styled(
+                "Comma-separate sweep values · Ctrl+S save · Ctrl+L load template",
                 Style::default().fg(Color::Rgb(0x8b, 0x94, 0x9e)),
-            )),
+            ))
         };
         frame.render_widget(Paragraph::new(footer_text), chunks[2]);
     }
@@ -293,7 +304,41 @@ impl ConfigureScreen {
                 ButtonAction::Cancel => {
                     self.cancelled = true;
                 }
+                ButtonAction::SaveTemplate => self.save_template(),
+                ButtonAction::LoadTemplate => self.load_template(),
             }
+        }
+    }
+
+    /// Build a RunPlan from the current form state and write it to the path
+    /// in the Template path field. Sets notice on success, error on failure.
+    pub fn save_template(&mut self) {
+        self.error = None;
+        self.notice = None;
+        let path_str = field_text(&self.fields, "Template path").trim().to_string();
+        if path_str.is_empty() {
+            self.error = Some("Template path is required".into());
+            return;
+        }
+        match save_template_inner(&self.fields, &path_str) {
+            Ok(()) => self.notice = Some(format!("Saved {}", path_str)),
+            Err(e) => self.error = Some(format!("Save failed: {:#}", e)),
+        }
+    }
+
+    /// Load a YAML template into the form fields. Sets notice on success,
+    /// error on failure.
+    pub fn load_template(&mut self) {
+        self.error = None;
+        self.notice = None;
+        let path_str = field_text(&self.fields, "Template path").trim().to_string();
+        if path_str.is_empty() {
+            self.error = Some("Template path is required".into());
+            return;
+        }
+        match load_template_inner(&mut self.fields, &path_str) {
+            Ok(()) => self.notice = Some(format!("Loaded {}", path_str)),
+            Err(e) => self.error = Some(format!("Load failed: {:#}", e)),
         }
     }
 
@@ -537,11 +582,25 @@ fn default_fields() -> Vec<Field> {
             hint: "(path to private key; supports ~)",
         },
         Field::Text {
+            label: "Jump host",
+            value: String::new(),
+            cursor: 0,
+            placeholder: "user@bastion.example.com",
+            hint: "(optional ssh -J jumphost; reach internal workers via bastion)",
+        },
+        Field::Text {
             label: "Service port",
             value: String::new(),
             cursor: 0,
             placeholder: "1611 / 8765",
             hint: "(blank = engine default: 1611 elbencho, 8765 fio)",
+        },
+        Field::Text {
+            label: "Template path",
+            value: String::new(),
+            cursor: 0,
+            placeholder: "./template.yaml",
+            hint: "(for Save/Load below; same YAML format as `elmaestro run`)",
         },
         Field::Button {
             label: "Run benchmark",
@@ -550,6 +609,14 @@ fn default_fields() -> Vec<Field> {
         Field::Button {
             label: "Cancel",
             action: ButtonAction::Cancel,
+        },
+        Field::Button {
+            label: "Save template",
+            action: ButtonAction::SaveTemplate,
+        },
+        Field::Button {
+            label: "Load template",
+            action: ButtonAction::LoadTemplate,
         },
     ]
 }
@@ -702,6 +769,7 @@ fn build_plan(fields: &[Field]) -> Result<(RunPlan, String, usize)> {
     let workers = field_text(fields, "Workers (hosts)").trim().to_string();
     let ssh_user = field_text(fields, "SSH user").trim().to_string();
     let ssh_key = field_text(fields, "SSH key").trim().to_string();
+    let jump_host = field_text(fields, "Jump host").trim().to_string();
     let svc_port_raw = field_text(fields, "Service port").trim().to_string();
 
     let default_service_port: u16 = match engine {
@@ -755,6 +823,11 @@ fn build_plan(fields: &[Field]) -> Result<(RunPlan, String, usize)> {
                     None
                 } else {
                     Some(PathBuf::from(&ssh_key))
+                },
+                ssh_jump: if jump_host.is_empty() {
+                    None
+                } else {
+                    Some(jump_host.clone())
                 },
                 elbencho_path: engine_path_default.into(),
                 service_port: port,
@@ -851,6 +924,246 @@ where
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Template save / load
+// ---------------------------------------------------------------------------
+
+/// Build the form's RunPlan and dump it as YAML to `path`. Skips writing
+/// if path is empty.
+fn save_template_inner(fields: &[Field], path: &str) -> Result<()> {
+    let (plan, _label, _repeats) = build_plan(fields)?;
+    let yaml = serde_yaml::to_string(&plan)
+        .map_err(|e| anyhow!("YAML encode: {}", e))?;
+    // Expand ~ in the path so users can save to ~/templates/foo.yaml.
+    let expanded = shellexpand::tilde(path).into_owned();
+    if let Some(parent) = std::path::Path::new(&expanded).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(&expanded, yaml)?;
+    Ok(())
+}
+
+/// Read a YAML template from `path` and unpack into the form fields. Errors
+/// out cleanly if the YAML's shape can't be represented by this form
+/// (multi-workload / multi-target / non-POSIX target / multi-axis sweep
+/// beyond bs/threads/iodepth).
+fn load_template_inner(fields: &mut [Field], path: &str) -> Result<()> {
+    let expanded = shellexpand::tilde(path).into_owned();
+    let plan = crate::config::loader::load(std::path::Path::new(&expanded))?;
+    apply_plan_to_fields(fields, &plan)
+}
+
+/// Reverse of build_plan: take a RunPlan and unpack it into the form fields
+/// so the user can edit and rerun.
+fn apply_plan_to_fields(fields: &mut [Field], plan: &crate::config::RunPlan) -> Result<()> {
+    if plan.targets.len() != 1 {
+        anyhow::bail!(
+            "template has {} targets; the form can only represent one",
+            plan.targets.len()
+        );
+    }
+    if plan.workloads.len() != 1 {
+        anyhow::bail!(
+            "template has {} workloads; the form can only represent one",
+            plan.workloads.len()
+        );
+    }
+    let posix = match &plan.targets[0] {
+        crate::config::Target::Posix(t) => t,
+        crate::config::Target::S3(_) => {
+            anyhow::bail!("template uses an S3 target; the form is POSIX-only")
+        }
+    };
+    let wl = &plan.workloads[0];
+
+    // Engine radio.
+    set_radio(fields, "Engine", match plan.engine {
+        crate::config::Engine::Elbencho => "elbencho",
+        crate::config::Engine::Fio => "fio",
+    });
+
+    // Target.
+    set_text(fields, "Mount path", &posix.mount_path.display().to_string());
+    set_text(fields, "Dataset subdir", &posix.dataset_subdir);
+
+    // Workload.
+    set_radio(fields, "Pattern", &wl.pattern);
+    set_text(fields, "Read mix %", &wl.rw_mix_pct_read.to_string());
+
+    // Sweep axes -> comma-separated lists in the form.
+    let mut bs_values = vec![wl.block_size];
+    let mut threads_values = vec![wl.threads_per_client];
+    let mut iodepth_values = vec![wl.io_depth];
+    for sw in &plan.sweeps {
+        if sw.base != wl.name {
+            continue;
+        }
+        if let Some(vs) = &sw.axes.block_size {
+            if !vs.is_empty() {
+                bs_values = vs.clone();
+            }
+        }
+        if let Some(vs) = &sw.axes.threads_per_client {
+            if !vs.is_empty() {
+                threads_values = vs.clone();
+            }
+        }
+        if let Some(vs) = &sw.axes.io_depth {
+            if !vs.is_empty() {
+                iodepth_values = vs.clone();
+            }
+        }
+        // Note: rw_mix_pct_read / dataset_size / client_count sweep axes
+        // aren't represented in the form. If a template uses them, we silently
+        // ignore (the loaded form won't be a perfect round-trip but will run).
+    }
+    set_text(
+        fields,
+        "Block size(s)",
+        &bs_values.iter().map(|b| human_bytes(*b)).collect::<Vec<_>>().join(","),
+    );
+    set_text(
+        fields,
+        "Threads",
+        &threads_values.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","),
+    );
+    set_text(
+        fields,
+        "IO depth",
+        &iodepth_values.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","),
+    );
+
+    set_text(
+        fields,
+        "File size",
+        &wl.file_size.map(human_bytes).unwrap_or_default(),
+    );
+    set_text(
+        fields,
+        "Files per thread",
+        &wl.file_count.map(|n| n.to_string()).unwrap_or_default(),
+    );
+    set_text(
+        fields,
+        "Duration (s)",
+        &wl.duration_s.map(|n| n.to_string()).unwrap_or_default(),
+    );
+    set_checkbox(fields, "Direct IO", wl.direct_io);
+    set_checkbox(fields, "Drop caches", wl.drop_caches_before);
+    set_text(fields, "Number of runs", "1");
+
+    // Clients: derive Workers / SSH user / SSH key from the first non-localhost
+    // client. localhost-only clients map to empty Workers field.
+    let remote: Vec<&crate::config::ClientHost> = plan
+        .clients
+        .iter()
+        .filter(|c| !matches!(c.host.as_str(), "localhost" | "127.0.0.1" | "::1" | ""))
+        .collect();
+    if remote.is_empty() {
+        set_text(fields, "Workers (hosts)", "");
+        set_text(fields, "SSH user", "");
+        set_text(fields, "SSH key", "");
+        set_text(fields, "Jump host", "");
+        set_text(fields, "Service port", "");
+    } else {
+        let first = remote[0];
+        let port = first.service_port;
+        let workers_str = remote
+            .iter()
+            .map(|c| {
+                if c.service_port == port {
+                    c.host.clone()
+                } else {
+                    format!("{}:{}", c.host, c.service_port)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        set_text(fields, "Workers (hosts)", &workers_str);
+        set_text(fields, "SSH user", first.ssh_user.as_deref().unwrap_or(""));
+        set_text(
+            fields,
+            "SSH key",
+            &first
+                .ssh_key
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        );
+        set_text(fields, "Jump host", first.ssh_jump.as_deref().unwrap_or(""));
+        let engine_default = match plan.engine {
+            crate::config::Engine::Elbencho => 1611,
+            crate::config::Engine::Fio => 8765,
+        };
+        let port_str = if port == engine_default {
+            String::new()
+        } else {
+            port.to_string()
+        };
+        set_text(fields, "Service port", &port_str);
+    }
+
+    Ok(())
+}
+
+fn set_text(fields: &mut [Field], label: &str, val: &str) {
+    for f in fields.iter_mut() {
+        if let Field::Text {
+            label: l,
+            value,
+            cursor,
+            ..
+        } = f
+        {
+            if *l == label {
+                *value = val.to_string();
+                *cursor = val.chars().count();
+                return;
+            }
+        }
+    }
+}
+
+fn set_radio(fields: &mut [Field], label: &str, opt: &str) {
+    for f in fields.iter_mut() {
+        if let Field::Radio { label: l, options, selected } = f {
+            if *l == label {
+                if let Some(idx) = options.iter().position(|o| *o == opt) {
+                    *selected = idx;
+                }
+                return;
+            }
+        }
+    }
+}
+
+fn set_checkbox(fields: &mut [Field], label: &str, checked_in: bool) {
+    for f in fields.iter_mut() {
+        if let Field::Checkbox { label: l, checked } = f {
+            if *l == label {
+                *checked = checked_in;
+                return;
+            }
+        }
+    }
+}
+
+/// 65536 -> "64KiB", 4194304 -> "4MiB". Mirrors python-side display.
+fn human_bytes(n: u64) -> String {
+    for (unit, base) in [
+        ("GiB", 1u64 << 30),
+        ("MiB", 1u64 << 20),
+        ("KiB", 1u64 << 10),
+    ] {
+        if n >= base && n % base == 0 {
+            return format!("{}{}", n / base, unit);
+        }
+    }
+    format!("{}", n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,6 +1206,18 @@ mod tests {
         assert!(plan.clients[0].ssh_key.is_none());
         assert_eq!(label, "sweep");  // defaults include comma-separated block sizes
         assert_eq!(repeats, 1);
+    }
+
+    #[test]
+    fn jump_host_propagates_to_every_client() {
+        let mut fields = default_fields();
+        set_text(&mut fields, "Workers (hosts)", "w1,w2");
+        set_text(&mut fields, "SSH user", "bench");
+        set_text(&mut fields, "Jump host", "user@bastion.example.com");
+        let (plan, _, _) = build_plan(&fields).expect("plan should validate");
+        for c in &plan.clients {
+            assert_eq!(c.ssh_jump.as_deref(), Some("user@bastion.example.com"));
+        }
     }
 
     #[test]
@@ -963,5 +1288,112 @@ mod tests {
         set_text(&mut fields, "Duration (s)", "");
         let err = build_plan(&fields).unwrap_err();
         assert!(format!("{:#}", err).contains("Duration or File size"));
+    }
+
+    #[test]
+    fn save_and_load_template_round_trips_through_yaml() {
+        // Configure a non-default-shaped form, save, clear, load, compare.
+        let mut fields = default_fields();
+        select_radio(&mut fields, "Engine", "fio");
+        set_text(&mut fields, "Mount path", "/mnt/test");
+        set_text(&mut fields, "Dataset subdir", "round-trip");
+        set_text(&mut fields, "Block size(s)", "4k,16k,1m");
+        set_text(&mut fields, "Threads", "8");
+        set_text(&mut fields, "IO depth", "4");
+        set_text(&mut fields, "File size", "512MiB");
+        set_text(&mut fields, "Files per thread", "4");
+        set_text(&mut fields, "Read mix %", "70");
+        set_text(&mut fields, "Workers (hosts)", "worker-01,worker-02");
+        set_text(&mut fields, "SSH user", "bench");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tpl.yaml");
+        let path_str = path.to_string_lossy().to_string();
+        save_template_inner(&fields, &path_str).expect("save");
+
+        // Fresh form, load the saved template.
+        let mut fresh = default_fields();
+        load_template_inner(&mut fresh, &path_str).expect("load");
+
+        // Compare key field values.
+        assert_eq!(field_radio_selected(&fresh, "Engine"), Some("fio"));
+        assert_eq!(field_text(&fresh, "Mount path"), "/mnt/test");
+        assert_eq!(field_text(&fresh, "Dataset subdir"), "round-trip");
+        // Block sizes get reformatted as human-bytes; 4k -> 4KiB, etc.
+        assert_eq!(field_text(&fresh, "Block size(s)"), "4KiB,16KiB,1MiB");
+        assert_eq!(field_text(&fresh, "Threads"), "8");
+        assert_eq!(field_text(&fresh, "IO depth"), "4");
+        assert_eq!(field_text(&fresh, "File size"), "512MiB");
+        assert_eq!(field_text(&fresh, "Files per thread"), "4");
+        assert_eq!(field_text(&fresh, "Read mix %"), "70");
+        assert_eq!(field_text(&fresh, "Workers (hosts)"), "worker-01,worker-02");
+        assert_eq!(field_text(&fresh, "SSH user"), "bench");
+
+        // Build plans from both forms and compare top-level shape.
+        let (a, _, _) = build_plan(&fields).unwrap();
+        let (b, _, _) = build_plan(&fresh).unwrap();
+        assert_eq!(a.engine, b.engine);
+        assert_eq!(a.clients.len(), b.clients.len());
+        assert_eq!(a.sweeps.len(), b.sweeps.len());
+    }
+
+    #[test]
+    fn load_template_rejects_multi_target_yaml() {
+        let yaml = r#"
+version: 1
+engine: elbencho
+output_dir: ./results
+clients:
+  - host: localhost
+targets:
+  - name: a
+    kind: posix
+    mount_path: /mnt/a
+  - name: b
+    kind: posix
+    mount_path: /mnt/b
+workloads:
+  - name: w
+    block_size: 4096
+    file_size: 4096
+runs:
+  - target: a
+    workload: w
+"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("multi.yaml");
+        std::fs::write(&p, yaml).unwrap();
+        let mut fields = default_fields();
+        let err = load_template_inner(&mut fields, &p.to_string_lossy()).unwrap_err();
+        assert!(format!("{:#}", err).contains("2 targets"));
+    }
+
+    #[test]
+    fn load_template_rejects_s3_target() {
+        let yaml = r#"
+version: 1
+engine: elbencho
+clients:
+  - host: localhost
+targets:
+  - name: s3t
+    kind: s3
+    endpoint: https://s3.example.com
+    bucket: b
+    credentials_ref: env:X
+workloads:
+  - name: w
+    block_size: 4096
+    file_size: 4096
+runs:
+  - target: s3t
+    workload: w
+"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("s3.yaml");
+        std::fs::write(&p, yaml).unwrap();
+        let mut fields = default_fields();
+        let err = load_template_inner(&mut fields, &p.to_string_lossy()).unwrap_err();
+        assert!(format!("{:#}", err).contains("S3"));
     }
 }

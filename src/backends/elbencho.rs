@@ -63,9 +63,12 @@ impl Backend for ElbenchoBackend {
             .and_then(|c| c.get(1))
             .map(|m| m.as_str().to_string());
 
+        // Real elbencho prints features lowercase ("s3 syncfs syscallh"),
+        // so match case-insensitively. Canonical capitalization is emitted
+        // so EngineVersion::has("S3") works against any build output.
         let mut features = Vec::new();
         for feat in ["S3", "CUDA", "CUFILE"] {
-            let re = Regex::new(&format!(r"\b{}\b", feat)).unwrap();
+            let re = Regex::new(&format!(r"(?i)\b{}\b", feat)).unwrap();
             if re.is_match(&raw_text) {
                 features.push(feat.into());
             }

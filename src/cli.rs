@@ -28,7 +28,14 @@ enum Command {
     /// Dry-run: print every spec a run would execute, without running.
     Expand { config: std::path::PathBuf },
     /// Execute the runs and sweeps in a config and render a report for each spec.
-    Run { config: std::path::PathBuf },
+    Run {
+        config: std::path::PathBuf,
+        /// Skip the pre-flight check (engine binaries / SSH / mount writability).
+        #[arg(long)]
+        no_check: bool,
+    },
+    /// Pre-flight: verify ssh, engine binaries, S3 capability, mount writability.
+    Check { config: std::path::PathBuf },
     /// (Re-)render HTML reports from existing result.json files.
     Report { results_dir: std::path::PathBuf },
     /// Overlay N run directories into one comparison HTML report.
@@ -56,7 +63,8 @@ pub fn run() -> Result<()> {
             print_expand(&plan)?;
             Ok(())
         }
-        Some(Command::Run { config }) => run_command(&config),
+        Some(Command::Run { config, no_check }) => run_command(&config, no_check),
+        Some(Command::Check { config }) => check_command(&config),
         Some(Command::Report { results_dir }) => report_command(&results_dir),
         Some(Command::Compare { run_dirs }) => compare_command(&run_dirs),
         Some(Command::Tui { config }) => crate::tui::run_tui(config.as_deref()),
@@ -116,8 +124,29 @@ fn read_result(path: &std::path::Path) -> Result<crate::results::schema::Result>
     Ok(r)
 }
 
-fn run_command(config_path: &std::path::Path) -> Result<()> {
+fn check_command(config_path: &std::path::Path) -> Result<()> {
     let plan = crate::config::loader::load(config_path)?;
+    let report = crate::engine::check::run_check(&plan)?;
+    report.print();
+    if !report.ok() {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+fn run_command(config_path: &std::path::Path, no_check: bool) -> Result<()> {
+    let plan = crate::config::loader::load(config_path)?;
+    if !no_check {
+        let report = crate::engine::check::run_check(&plan)?;
+        if !report.ok() {
+            report.print();
+            eprintln!(
+                "\nrefusing to run because pre-flight check failed. \
+                 Fix the issues above, or pass --no-check to skip."
+            );
+            std::process::exit(2);
+        }
+    }
     let pairs = crate::config::sweep::materialize_run_refs(&plan)?;
     if pairs.is_empty() {
         anyhow::bail!("config has neither `runs:` nor `sweeps:` to execute");

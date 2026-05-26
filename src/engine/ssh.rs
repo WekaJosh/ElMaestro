@@ -62,6 +62,13 @@ pub fn ssh_base_argv(client: &ClientHost) -> Vec<String> {
         argv.push("-i".into());
         argv.push(expanded);
     }
+    if let Some(jump) = &client.ssh_jump {
+        let j = jump.trim();
+        if !j.is_empty() {
+            argv.push("-J".into());
+            argv.push(j.to_string());
+        }
+    }
     let host = match &client.ssh_user {
         Some(user) => format!("{}@{}", user, client.host),
         None => client.host.clone(),
@@ -263,6 +270,30 @@ mod tests {
         assert!(argv.iter().any(|a| a == "-i"));
         assert!(argv.iter().any(|a| a == "/tmp/key"));
         assert!(argv.iter().any(|a| a == "bench@h"));
+    }
+
+    #[test]
+    fn base_argv_includes_jump_host_when_set() {
+        let argv = ssh_base_argv(&ClientHost {
+            host: "internal-worker".into(),
+            ssh_user: Some("bench".into()),
+            ssh_jump: Some("user@bastion.example.com".into()),
+            ..Default::default()
+        });
+        let j_idx = argv.iter().position(|a| a == "-J").expect("ssh -J flag");
+        assert_eq!(argv[j_idx + 1], "user@bastion.example.com");
+        // The final host arg is the actual target, not the jump.
+        assert_eq!(argv.last().unwrap(), "bench@internal-worker");
+    }
+
+    #[test]
+    fn base_argv_omits_jump_host_when_blank() {
+        let argv = ssh_base_argv(&ClientHost {
+            host: "h".into(),
+            ssh_jump: Some("   ".into()),
+            ..Default::default()
+        });
+        assert!(!argv.iter().any(|a| a == "-J"));
     }
 
     #[test]
