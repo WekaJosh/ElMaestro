@@ -59,7 +59,7 @@ impl HomeScreen {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Rgb(0x58, 0xa6, 0xff)))
             .padding(Padding::new(4, 4, 2, 2))
-            .title(" ElMaestro ")
+            .title(format!(" ElMaestro v{} ", crate::VERSION))
             .title_style(Style::default().add_modifier(Modifier::BOLD));
         let card = centered(area, 70, 16);
         frame.render_widget(Clear, card);
