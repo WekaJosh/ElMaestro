@@ -45,13 +45,19 @@ const HOME_ITEMS: &[&str] = &[
 
 pub struct HomeScreen {
     state: ListState,
+    /// Rect of the menu list, captured at render time so the mouse-click
+    /// handler can map row -> item index.
+    list_rect: Rect,
 }
 
 impl HomeScreen {
     pub fn new() -> Self {
         let mut state = ListState::default();
         state.select(Some(0));
-        Self { state }
+        Self {
+            state,
+            list_rect: Rect::default(),
+        }
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
@@ -87,7 +93,22 @@ impl HomeScreen {
                     .add_modifier(Modifier::BOLD),
             )
             .highlight_symbol("▸ ");
+        self.list_rect = chunks[1];
         frame.render_stateful_widget(list, chunks[1], &mut self.state);
+    }
+
+    /// Hit-test a click against the menu. Returns the action to invoke,
+    /// or None if the click was outside the list.
+    pub fn click_at(&mut self, col: u16, row: u16) -> Option<HomeAction> {
+        if !rect_contains(self.list_rect, col, row) {
+            return None;
+        }
+        let idx = (row - self.list_rect.y) as usize;
+        if idx >= HOME_ITEMS.len() {
+            return None;
+        }
+        self.state.select(Some(idx));
+        Some(self.selected_action())
     }
 
     pub fn select_next(&mut self) {
@@ -129,6 +150,7 @@ pub struct PickConfigScreen {
     entries: Vec<PathBuf>,
     state: ListState,
     pub error: Option<String>,
+    list_rect: Rect,
 }
 
 impl PickConfigScreen {
@@ -138,6 +160,7 @@ impl PickConfigScreen {
             entries: Vec::new(),
             state: ListState::default(),
             error: None,
+            list_rect: Rect::default(),
         };
         s.refresh();
         s
@@ -234,6 +257,7 @@ impl PickConfigScreen {
                     .add_modifier(Modifier::BOLD),
             )
             .highlight_symbol("▸ ");
+        self.list_rect = chunks[2];
         frame.render_stateful_widget(list, chunks[2], &mut self.state);
 
         let footer_text = self
@@ -279,6 +303,21 @@ impl PickConfigScreen {
         } else {
             Some(p)
         }
+    }
+
+    /// Hit-test a click. Returns Some(path) if the click selected a file
+    /// (caller treats it as "picked"). Returns None for dir-navigation or
+    /// clicks outside the list (in either case state is updated as needed).
+    pub fn click_at(&mut self, col: u16, row: u16) -> Option<PathBuf> {
+        if !rect_contains(self.list_rect, col, row) {
+            return None;
+        }
+        let idx = (row - self.list_rect.y) as usize;
+        if idx >= self.entries.len() {
+            return None;
+        }
+        self.state.select(Some(idx));
+        self.activate_selected()
     }
 }
 
@@ -582,6 +621,7 @@ pub struct BrowseScreen {
     runs: Vec<RunRow>,
     state: TableState,
     pub error: Option<String>,
+    table_rect: Rect,
 }
 
 struct RunRow {
@@ -598,6 +638,7 @@ impl BrowseScreen {
             runs: Vec::new(),
             state: TableState::default(),
             error: None,
+            table_rect: Rect::default(),
         };
         s.refresh();
         s
@@ -700,6 +741,7 @@ impl BrowseScreen {
                 .add_modifier(Modifier::BOLD),
         )
         .block(Block::default().borders(Borders::ALL).title(" Runs "));
+        self.table_rect = chunks[2];
         frame.render_stateful_widget(table, chunks[2], &mut self.state);
 
         let footer_style = if self.error.is_some() {
@@ -731,6 +773,27 @@ impl BrowseScreen {
         }
         let i = self.state.selected().unwrap_or(0);
         self.state.select(Some((i + self.runs.len() - 1) % self.runs.len()));
+    }
+
+    /// Hit-test a click. Selects the row and opens its report (mimics
+    /// Enter on a focused row).
+    pub fn click_at(&mut self, col: u16, row: u16) {
+        if !rect_contains(self.table_rect, col, row) {
+            return;
+        }
+        // Skip the table's header + border lines. The table widget renders
+        // a border (top line) and a header (1 line), so data rows start at
+        // y + 2.
+        let header_offset = 2u16;
+        if row < self.table_rect.y + header_offset {
+            return;
+        }
+        let idx = (row - self.table_rect.y - header_offset) as usize;
+        if idx >= self.runs.len() {
+            return;
+        }
+        self.state.select(Some(idx));
+        self.open_selected();
     }
 
     pub fn open_selected(&mut self) {
@@ -807,6 +870,7 @@ pub struct CompareScreen {
     runs: Vec<ComparePick>,
     state: ListState,
     pub message: Option<String>,
+    list_rect: Rect,
 }
 
 struct ComparePick {
@@ -822,6 +886,7 @@ impl CompareScreen {
             runs: Vec::new(),
             state: ListState::default(),
             message: None,
+            list_rect: Rect::default(),
         };
         s.refresh();
         s
@@ -900,6 +965,7 @@ impl CompareScreen {
                     .add_modifier(Modifier::BOLD),
             )
             .highlight_symbol("▸ ");
+        self.list_rect = chunks[2];
         frame.render_stateful_widget(list, chunks[2], &mut self.state);
 
         let footer_style = if self.message.is_some() {
@@ -939,6 +1005,19 @@ impl CompareScreen {
                 r.selected = !r.selected;
             }
         }
+    }
+
+    /// Hit-test a click. Click on a row selects it and toggles its checkbox.
+    pub fn click_at(&mut self, col: u16, row: u16) {
+        if !rect_contains(self.list_rect, col, row) {
+            return;
+        }
+        let idx = (row - self.list_rect.y) as usize;
+        if idx >= self.runs.len() {
+            return;
+        }
+        self.state.select(Some(idx));
+        self.toggle_selected();
     }
 
     pub fn render_compare(&mut self) {
@@ -983,6 +1062,11 @@ impl CompareScreen {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// True if (col, row) falls inside the given Rect.
+pub fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
+    col >= r.x && col < r.x.saturating_add(r.width) && row >= r.y && row < r.y.saturating_add(r.height)
+}
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let w = width.min(area.width);

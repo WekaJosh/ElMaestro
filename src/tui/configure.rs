@@ -182,6 +182,9 @@ pub struct ConfigureScreen {
     /// transition to a RunScreen.
     pub built_plan: Option<(RunPlan, String, usize)>,
     pub cancelled: bool,
+    /// Rect of the form body, captured at render time so mouse clicks can
+    /// map row -> field index.
+    body_rect: ratatui::layout::Rect,
 }
 
 impl ConfigureScreen {
@@ -192,6 +195,7 @@ impl ConfigureScreen {
             error: None,
             built_plan: None,
             cancelled: false,
+            body_rect: ratatui::layout::Rect::default(),
         }
     }
 
@@ -232,6 +236,7 @@ impl ConfigureScreen {
             .map(|(i, f)| f.render_line(i == self.focused, inner_area.width))
             .collect();
         let body = Paragraph::new(lines).wrap(Wrap { trim: false });
+        self.body_rect = inner_area;
         frame.render_widget(body, inner_area);
 
         let footer_text = match &self.error {
@@ -379,6 +384,31 @@ impl ConfigureScreen {
         matches!(self.fields.get(self.focused), Some(Field::Text { .. }))
     }
 
+    /// Hit-test a click. Focuses the clicked field; if it's a button /
+    /// checkbox / radio, also activates it (toggles or runs).
+    pub fn click_at(&mut self, col: u16, row: u16) {
+        let r = self.body_rect;
+        if col < r.x
+            || col >= r.x.saturating_add(r.width)
+            || row < r.y
+            || row >= r.y.saturating_add(r.height)
+        {
+            return;
+        }
+        let idx = (row - r.y) as usize;
+        if idx >= self.fields.len() {
+            return;
+        }
+        self.focused = idx;
+        self.error = None;
+        // For non-text fields, treat a click as activation (cycle radio,
+        // toggle checkbox, press button). Text fields just focus.
+        let is_text = matches!(self.fields[idx], Field::Text { .. });
+        if !is_text {
+            self.activate();
+        }
+    }
+
     fn try_build_plan(&mut self) {
         match build_plan(&self.fields) {
             Ok((plan, label, repeats)) => {
@@ -484,6 +514,34 @@ fn default_fields() -> Vec<Field> {
             cursor: 1,
             placeholder: "1",
             hint: "(>1 repeats the whole sweep for variance)",
+        },
+        Field::Text {
+            label: "Workers (hosts)",
+            value: String::new(),
+            cursor: 0,
+            placeholder: "blank = localhost",
+            hint: "(comma-separated, e.g. worker-01,worker-02:1611)",
+        },
+        Field::Text {
+            label: "SSH user",
+            value: String::new(),
+            cursor: 0,
+            placeholder: "blank = current user",
+            hint: "(only used when Workers is set)",
+        },
+        Field::Text {
+            label: "SSH key",
+            value: String::new(),
+            cursor: 0,
+            placeholder: "blank = ssh-agent / default",
+            hint: "(path to private key; supports ~)",
+        },
+        Field::Text {
+            label: "Service port",
+            value: String::new(),
+            cursor: 0,
+            placeholder: "1611 / 8765",
+            hint: "(blank = engine default: 1611 elbencho, 8765 fio)",
         },
         Field::Button {
             label: "Run benchmark",
@@ -641,11 +699,78 @@ fn build_plan(fields: &[Field]) -> Result<(RunPlan, String, usize)> {
         cleanup: false,
     });
 
+    let workers = field_text(fields, "Workers (hosts)").trim().to_string();
+    let ssh_user = field_text(fields, "SSH user").trim().to_string();
+    let ssh_key = field_text(fields, "SSH key").trim().to_string();
+    let svc_port_raw = field_text(fields, "Service port").trim().to_string();
+
+    let default_service_port: u16 = match engine {
+        Engine::Elbencho => 1611,
+        Engine::Fio => 8765,
+    };
+    let explicit_svc_port: Option<u16> = if svc_port_raw.is_empty() {
+        None
+    } else {
+        Some(
+            svc_port_raw
+                .parse()
+                .map_err(|_| anyhow!("Service port must be an integer"))?,
+        )
+    };
+
+    let clients: Vec<ClientHost> = if workers.is_empty() {
+        vec![ClientHost::default()]
+    } else {
+        let engine_path_default = match engine {
+            Engine::Elbencho => "elbencho",
+            Engine::Fio => "fio",
+        };
+        let mut out: Vec<ClientHost> = Vec::new();
+        for entry in workers.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let (host, port_str) = match entry.split_once(':') {
+                Some((h, p)) => (h.trim().to_string(), Some(p.trim())),
+                None => (entry.to_string(), None),
+            };
+            let port = if let Some(p) = port_str {
+                p.parse::<u16>().map_err(|_| anyhow!(
+                    "Worker {:?} port must be an integer",
+                    entry
+                ))?
+            } else {
+                explicit_svc_port.unwrap_or(default_service_port)
+            };
+            out.push(ClientHost {
+                host,
+                ssh_user: if ssh_user.is_empty() {
+                    None
+                } else {
+                    Some(ssh_user.clone())
+                },
+                ssh_port: 22,
+                ssh_key: if ssh_key.is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(&ssh_key))
+                },
+                elbencho_path: engine_path_default.into(),
+                service_port: port,
+            });
+        }
+        if out.is_empty() {
+            anyhow::bail!("Workers parsed to an empty list");
+        }
+        out
+    };
+
     let mut plan = RunPlan {
         version: 1,
         engine,
         output_dir: PathBuf::from("./results"),
-        clients: vec![ClientHost::default()],
+        clients,
         targets: vec![target],
         workloads: vec![workload],
         runs: Vec::new(),
@@ -724,4 +849,119 @@ where
         );
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: set a Text field's value (test-only; bypasses cursor tracking).
+    fn set_text(fields: &mut [Field], label: &str, val: &str) {
+        for f in fields.iter_mut() {
+            if let Field::Text { label: l, value, cursor, .. } = f {
+                if *l == label {
+                    *value = val.to_string();
+                    *cursor = val.chars().count();
+                    return;
+                }
+            }
+        }
+        panic!("no Text field named {:?}", label);
+    }
+
+    fn select_radio(fields: &mut [Field], label: &str, opt: &str) {
+        for f in fields.iter_mut() {
+            if let Field::Radio { label: l, options, selected } = f {
+                if *l == label {
+                    let idx = options.iter().position(|o| *o == opt)
+                        .unwrap_or_else(|| panic!("no option {:?} on {:?}", opt, label));
+                    *selected = idx;
+                    return;
+                }
+            }
+        }
+        panic!("no Radio field named {:?}", label);
+    }
+
+    #[test]
+    fn defaults_build_a_single_localhost_plan() {
+        let fields = default_fields();
+        let (plan, label, repeats) = build_plan(&fields).expect("defaults should validate");
+        assert_eq!(plan.clients.len(), 1, "default = single localhost");
+        assert_eq!(plan.clients[0].host, "localhost");
+        assert!(plan.clients[0].ssh_user.is_none());
+        assert!(plan.clients[0].ssh_key.is_none());
+        assert_eq!(label, "sweep");  // defaults include comma-separated block sizes
+        assert_eq!(repeats, 1);
+    }
+
+    #[test]
+    fn workers_field_produces_multi_client_plan() {
+        let mut fields = default_fields();
+        set_text(&mut fields, "Workers (hosts)", "worker-01,worker-02:1612,worker-03");
+        set_text(&mut fields, "SSH user", "bench");
+        set_text(&mut fields, "SSH key", "~/.ssh/id_ed25519");
+        let (plan, _, _) = build_plan(&fields).expect("plan should validate");
+        assert_eq!(plan.clients.len(), 3);
+        assert_eq!(plan.clients[0].host, "worker-01");
+        assert_eq!(plan.clients[1].host, "worker-02");
+        assert_eq!(plan.clients[2].host, "worker-03");
+        // Default service port is 1611 for elbencho when not specified.
+        assert_eq!(plan.clients[0].service_port, 1611);
+        // Worker 2 had a per-host override.
+        assert_eq!(plan.clients[1].service_port, 1612);
+        // Worker 3 has no override.
+        assert_eq!(plan.clients[2].service_port, 1611);
+        // SSH user + key applied to every worker.
+        assert_eq!(plan.clients[0].ssh_user.as_deref(), Some("bench"));
+        assert_eq!(
+            plan.clients[0].ssh_key.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            Some("~/.ssh/id_ed25519".into())
+        );
+    }
+
+    #[test]
+    fn fio_engine_picks_8765_as_default_service_port() {
+        let mut fields = default_fields();
+        select_radio(&mut fields, "Engine", "fio");
+        set_text(&mut fields, "Workers (hosts)", "worker-01");
+        let (plan, _, _) = build_plan(&fields).expect("plan should validate");
+        assert_eq!(plan.clients[0].service_port, 8765);
+    }
+
+    #[test]
+    fn explicit_service_port_overrides_engine_default() {
+        let mut fields = default_fields();
+        select_radio(&mut fields, "Engine", "fio");
+        set_text(&mut fields, "Workers (hosts)", "worker-01");
+        set_text(&mut fields, "Service port", "9999");
+        let (plan, _, _) = build_plan(&fields).expect("plan should validate");
+        assert_eq!(plan.clients[0].service_port, 9999);
+    }
+
+    #[test]
+    fn workers_field_blank_means_localhost() {
+        let mut fields = default_fields();
+        set_text(&mut fields, "Workers (hosts)", "   ");  // whitespace only
+        let (plan, _, _) = build_plan(&fields).expect("plan should validate");
+        assert_eq!(plan.clients.len(), 1);
+        assert_eq!(plan.clients[0].host, "localhost");
+    }
+
+    #[test]
+    fn invalid_worker_port_errors() {
+        let mut fields = default_fields();
+        set_text(&mut fields, "Workers (hosts)", "worker-01:not-a-port");
+        let err = build_plan(&fields).unwrap_err();
+        assert!(format!("{:#}", err).contains("port"));
+    }
+
+    #[test]
+    fn validation_blocks_missing_duration_and_filesize() {
+        let mut fields = default_fields();
+        set_text(&mut fields, "File size", "");
+        set_text(&mut fields, "Duration (s)", "");
+        let err = build_plan(&fields).unwrap_err();
+        assert!(format!("{:#}", err).contains("Duration or File size"));
+    }
 }

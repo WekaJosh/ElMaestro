@@ -83,17 +83,87 @@ impl App {
             // Poll for input with a short timeout so the run-screen tick stays
             // responsive when events come in from the worker channel.
             if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind != KeyEventKind::Press {
-                        continue;
+                match event::read()? {
+                    Event::Key(key) => {
+                        if key.kind != KeyEventKind::Press {
+                            continue;
+                        }
+                        if self.handle_key(key.code) {
+                            return Ok(());
+                        }
                     }
-                    let exit = self.handle_key(key.code);
-                    if exit {
-                        return Ok(());
+                    Event::Mouse(m) => {
+                        use crossterm::event::{MouseButton, MouseEventKind};
+                        if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+                            if self.handle_click(m.column, m.row) {
+                                return Ok(());
+                            }
+                        }
                     }
+                    _ => {}
                 }
             }
         }
+    }
+
+    /// Mouse-click dispatch. Returns true if the app should exit.
+    fn handle_click(&mut self, col: u16, row: u16) -> bool {
+        match self.stack.last_mut() {
+            Some(Screen::Home(home)) => {
+                if let Some(action) = home.click_at(col, row) {
+                    match action {
+                        super::screens::HomeAction::Configure => {
+                            self.stack.push(Screen::Configure(ConfigureScreen::new()));
+                        }
+                        super::screens::HomeAction::PickYaml => {
+                            let start = std::env::current_dir()
+                                .unwrap_or_else(|_| PathBuf::from("."));
+                            self.stack
+                                .push(Screen::PickConfigForRun(PickConfigScreen::new(start)));
+                        }
+                        super::screens::HomeAction::Browse => {
+                            let root = default_results_root();
+                            self.stack.push(Screen::Browse(BrowseScreen::new(root)));
+                        }
+                        super::screens::HomeAction::Compare => {
+                            let root = default_results_root();
+                            self.stack.push(Screen::Compare(CompareScreen::new(root)));
+                        }
+                        super::screens::HomeAction::Quit => return true,
+                    }
+                }
+            }
+            Some(Screen::Configure(form)) => {
+                form.click_at(col, row);
+                if form.cancelled {
+                    self.stack.pop();
+                    if self.stack.is_empty() {
+                        return true;
+                    }
+                    return false;
+                }
+                if let Some((plan, label, repeats)) = form.built_plan.take() {
+                    self.stack.pop();
+                    self.stack
+                        .push(Screen::Run(RunScreen::from_plan(plan, label, repeats)));
+                    return false;
+                }
+            }
+            Some(Screen::PickConfigForRun(picker)) => {
+                if let Some(path) = picker.click_at(col, row) {
+                    self.stack.pop();
+                    self.stack.push(Screen::Run(RunScreen::new(path)));
+                }
+            }
+            Some(Screen::Browse(b)) => {
+                b.click_at(col, row);
+            }
+            Some(Screen::Compare(c)) => {
+                c.click_at(col, row);
+            }
+            Some(Screen::Run(_)) | None => {}
+        }
+        false
     }
 
     /// Returns true if the app should exit.
