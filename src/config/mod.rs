@@ -1,5 +1,6 @@
 //! Config: YAML schemas, loader with placeholder expansion, sweep expansion.
 
+pub mod host_expand;
 pub mod loader;
 pub mod models;
 pub mod sweep;

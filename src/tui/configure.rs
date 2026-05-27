@@ -565,7 +565,7 @@ fn default_fields() -> Vec<Field> {
             value: String::new(),
             cursor: 0,
             placeholder: "blank = localhost",
-            hint: "(comma-separated, e.g. worker-01,worker-02:1611)",
+            hint: "(comma-sep; brace-expand: 10.10.10.{1..100}, node{01..16}, gpu{a,b,c})",
         },
         Field::Text {
             label: "SSH user",
@@ -794,7 +794,11 @@ fn build_plan(fields: &[Field]) -> Result<(RunPlan, String, usize)> {
             Engine::Fio => "fio",
         };
         let mut out: Vec<ClientHost> = Vec::new();
-        for entry in workers.split(',') {
+        // Bash-style brace expansion: `10.10.10.{1..100}` → 100 entries,
+        // `node{01..16}` → "node01".."node16", `gpu{a,b,c}` → 3 hosts,
+        // cartesian over multiple braces, etc. See config/host_expand.rs.
+        let expanded = crate::config::host_expand::expand_hosts(&workers);
+        for entry in expanded {
             let entry = entry.trim();
             if entry.is_empty() {
                 continue;
