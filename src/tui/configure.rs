@@ -186,6 +186,10 @@ pub struct ConfigureScreen {
     /// transition to a RunScreen.
     pub built_plan: Option<(RunPlan, String, usize)>,
     pub cancelled: bool,
+    /// Set by Ctrl+L or the [Load template] button. The app drains this
+    /// to push a PickTemplateForLoad file picker; on Enter from the
+    /// picker, the chosen path is fed back via load_template_from().
+    pub pending_pick_template: bool,
     /// Rect of the form body, captured at render time so mouse clicks can
     /// map row -> field index.
     body_rect: ratatui::layout::Rect,
@@ -200,6 +204,7 @@ impl ConfigureScreen {
             notice: None,
             built_plan: None,
             cancelled: false,
+            pending_pick_template: false,
             body_rect: ratatui::layout::Rect::default(),
         }
     }
@@ -326,18 +331,29 @@ impl ConfigureScreen {
         }
     }
 
-    /// Load a YAML template into the form fields. Sets notice on success,
-    /// error on failure.
+    /// Open the template file picker. The app drains
+    /// `pending_pick_template` after this returns, pushes a
+    /// PickTemplateForLoad screen, and pipes the user's pick back
+    /// through `load_template_from`.
     pub fn load_template(&mut self) {
         self.error = None;
         self.notice = None;
-        let path_str = field_text(&self.fields, "Template path").trim().to_string();
-        if path_str.is_empty() {
-            self.error = Some("Template path is required".into());
-            return;
-        }
+        self.pending_pick_template = true;
+    }
+
+    /// Load a YAML template into the form fields from a specific path.
+    /// Called by the app after the file picker returns. Updates the
+    /// Template path field to reflect what was loaded so a subsequent
+    /// Ctrl+S writes back to the same file by default.
+    pub fn load_template_from(&mut self, path: &std::path::Path) {
+        self.error = None;
+        self.notice = None;
+        let path_str = path.to_string_lossy().into_owned();
         match load_template_inner(&mut self.fields, &path_str) {
-            Ok(()) => self.notice = Some(format!("Loaded {}", path_str)),
+            Ok(()) => {
+                set_text(&mut self.fields, "Template path", &path_str);
+                self.notice = Some(format!("Loaded {}", path_str));
+            }
             Err(e) => self.error = Some(format!("Load failed: {:#}", e)),
         }
     }
@@ -596,11 +612,14 @@ fn default_fields() -> Vec<Field> {
             hint: "(blank = engine default: 1611 elbencho, 8765 fio)",
         },
         Field::Text {
+            // Filled by Save with the path you write to, and by Load with
+            // the path you picked. Edit it directly only if you want to
+            // type a save destination.
             label: "Template path",
             value: String::new(),
             cursor: 0,
             placeholder: "./template.yaml",
-            hint: "(for Save/Load below; same YAML format as `elmaestro run`)",
+            hint: "(Ctrl+S saves here; Ctrl+L opens a picker to choose a YAML to load)",
         },
         Field::Button {
             label: "Run benchmark",

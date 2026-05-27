@@ -86,7 +86,10 @@ pub enum RunEvent {
 pub enum SpecStatus {
     Completed,
     Failed(i32),
-    Error,
+    /// Engine returned Err before producing a result. The string is the
+    /// formatted anyhow chain (`{:#}`) so the TUI can show it to the
+    /// user instead of just "error".
+    Error(String),
 }
 
 impl SpecStatus {
@@ -94,7 +97,14 @@ impl SpecStatus {
         match self {
             SpecStatus::Completed => "completed".into(),
             SpecStatus::Failed(rc) => format!("failed:{}", rc),
-            SpecStatus::Error => "error".into(),
+            SpecStatus::Error(_) => "error".into(),
+        }
+    }
+
+    pub fn error_detail(&self) -> Option<&str> {
+        match self {
+            SpecStatus::Error(msg) => Some(msg.as_str()),
+            _ => None,
         }
     }
 }
@@ -211,9 +221,14 @@ fn execute_one_iteration(plan: &RunPlan, label: &str, tx: &Sender<RunEvent>) -> 
                     let metrics = SpecMetrics::from_result(&result);
                     (st, Some(report_path), Some(result_path), Some(metrics))
                 }
-                Err(_) => {
+                Err(e) => {
                     failed += 1;
-                    (SpecStatus::Error, None, None, None)
+                    // Capture the full anyhow chain so users see the
+                    // actual reason in the Run screen instead of just
+                    // "error". Common multi-host failures (ssh
+                    // unreachable, service start timeout, port already
+                    // bound) all surface here.
+                    (SpecStatus::Error(format!("{:#}", e)), None, None, None)
                 }
             };
         let duration_s = (Utc::now() - started).num_milliseconds() as f64 / 1000.0;

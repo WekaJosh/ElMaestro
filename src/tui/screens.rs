@@ -26,6 +26,10 @@ pub enum Screen {
     Home(HomeScreen),
     Configure(super::configure::ConfigureScreen),
     PickConfigForRun(PickConfigScreen),
+    /// Same picker widget as PickConfigForRun, but the Enter handler
+    /// dispatches the chosen path into the Configure screen underneath
+    /// (via load_template_from) instead of starting a Run.
+    PickTemplateForLoad(PickConfigScreen),
     Run(RunScreen),
     Browse(BrowseScreen),
     Compare(CompareScreen),
@@ -359,6 +363,11 @@ pub struct RowState {
     /// Path to result.json on disk so the Report viewer can load it
     /// when the user presses Enter on this row.
     pub result_path: Option<PathBuf>,
+    /// Full error message when status is "error". Shown in the footer
+    /// of the Run screen when the user highlights an errored row so
+    /// they can see what actually went wrong (ssh failure, service
+    /// start timeout, missing binary, etc.).
+    pub error_detail: Option<String>,
 }
 
 impl RunScreen {
@@ -439,14 +448,18 @@ impl RunScreen {
                 duration: String::new(),
                 metrics: None,
                 result_path: None,
+                error_detail: None,
             });
         }
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+        // Footer is 3 rows so a multi-line error message (typically a
+        // wrapped 2-line message like "ssh to 10.10.10.5: connection
+        // refused: ...") is fully visible.
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(2), Constraint::Min(0), Constraint::Length(1)])
+            .constraints([Constraint::Length(2), Constraint::Min(0), Constraint::Length(3)])
             .split(area);
         let status_style = if self.running {
             Style::default().fg(Color::Rgb(0xd2, 0x99, 0x22))
@@ -532,18 +545,39 @@ impl RunScreen {
             .block(Block::default().borders(Borders::ALL).title(" Specs "));
         frame.render_stateful_widget(table, chunks[1], &mut self.table_state);
 
-        let footer_text = if self.running {
-            "Running... [↑/↓] highlight · [enter] view report · [esc] cannot interrupt mid-run"
+        // If the highlighted row has an error captured, show it in the
+        // footer so the user can actually see what failed (ssh
+        // unreachable, service-start timeout, etc.) instead of a bare
+        // "error" label in the table.
+        let selected_err = self
+            .table_state
+            .selected()
+            .and_then(|i| self.rows.get(i))
+            .and_then(|r| r.error_detail.as_deref());
+        let (footer_text, footer_style) = if let Some(err) = selected_err {
+            (
+                format!("✗ {}", err),
+                Style::default().fg(Color::Rgb(0xf8, 0x51, 0x49)),
+            )
+        } else if self.running {
+            (
+                "Running... [↑/↓] highlight · [enter] view report · [esc] cannot interrupt mid-run".into(),
+                Style::default().fg(Color::Rgb(0x8b, 0x94, 0x9e)),
+            )
         } else if self.finished {
-            "Done. [↑/↓] select · [enter] view report · [esc] back to home"
+            (
+                "Done. [↑/↓] select · [enter] view report · [esc] back to home".into(),
+                Style::default().fg(Color::Rgb(0x8b, 0x94, 0x9e)),
+            )
         } else {
-            "[r] run · [esc] back · [↑/↓] navigate"
+            (
+                "[r] run · [esc] back · [↑/↓] navigate".into(),
+                Style::default().fg(Color::Rgb(0x8b, 0x94, 0x9e)),
+            )
         };
         frame.render_widget(
-            Paragraph::new(Span::styled(
-                footer_text,
-                Style::default().fg(Color::Rgb(0x8b, 0x94, 0x9e)),
-            )),
+            Paragraph::new(Span::styled(footer_text, footer_style))
+                .wrap(Wrap { trim: true }),
             chunks[2],
         );
     }
@@ -621,10 +655,12 @@ impl RunScreen {
                 ..
             } => {
                 if let Some(row) = self.rows.iter_mut().find(|r| r.idx == index) {
+                    let detail = status.error_detail().map(String::from);
                     row.status = status.label();
                     row.duration = format!("{:.1}s", duration_s);
                     row.metrics = metrics;
                     row.result_path = result_path;
+                    row.error_detail = detail;
                 }
             }
             RunEvent::RunFinished {

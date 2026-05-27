@@ -166,6 +166,7 @@ impl App {
                         Screen::Home(s) => s.render(frame, area),
                         Screen::Configure(s) => s.render(frame, area),
                         Screen::PickConfigForRun(s) => s.render(frame, area),
+                        Screen::PickTemplateForLoad(s) => s.render(frame, area),
                         Screen::Run(s) => s.render(frame, area),
                         Screen::Browse(s) => s.render(frame, area),
                         Screen::Compare(s) => s.render(frame, area),
@@ -187,16 +188,27 @@ impl App {
                         // Configure screen. Intercept before normal dispatch
                         // so 's' / 'l' still work as text input on text fields.
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            if let Some(Screen::Configure(form)) =
-                                self.stack.last_mut()
-                            {
+                            if matches!(self.stack.last(), Some(Screen::Configure(_))) {
                                 match key.code {
                                     KeyCode::Char('s') | KeyCode::Char('S') => {
-                                        form.save_template();
+                                        if let Some(Screen::Configure(form)) =
+                                            self.stack.last_mut()
+                                        {
+                                            form.save_template();
+                                        }
                                         continue;
                                     }
                                     KeyCode::Char('l') | KeyCode::Char('L') => {
-                                        form.load_template();
+                                        // Open the template file picker.
+                                        // The picker's Enter handler pops
+                                        // itself and calls
+                                        // load_template_from on the
+                                        // Configure underneath.
+                                        let start = std::env::current_dir()
+                                            .unwrap_or_else(|_| PathBuf::from("."));
+                                        self.stack.push(Screen::PickTemplateForLoad(
+                                            PickConfigScreen::new(start),
+                                        ));
                                         continue;
                                     }
                                     _ => {}
@@ -268,6 +280,14 @@ impl App {
                     }
                     return false;
                 }
+                if std::mem::take(&mut form.pending_pick_template) {
+                    let start = std::env::current_dir()
+                        .unwrap_or_else(|_| PathBuf::from("."));
+                    self.stack.push(Screen::PickTemplateForLoad(
+                        PickConfigScreen::new(start),
+                    ));
+                    return false;
+                }
                 if let Some((plan, label, repeats)) = form.built_plan.take() {
                     self.stack.pop();
                     self.stack
@@ -279,6 +299,14 @@ impl App {
                 if let Some(path) = picker.click_at(col, row) {
                     self.stack.pop();
                     self.stack.push(Screen::Run(RunScreen::new(path)));
+                }
+            }
+            Some(Screen::PickTemplateForLoad(picker)) => {
+                if let Some(path) = picker.click_at(col, row) {
+                    self.stack.pop();
+                    if let Some(Screen::Configure(form)) = self.stack.last_mut() {
+                        form.load_template_from(&path);
+                    }
                 }
             }
             Some(Screen::Browse(b)) => {
@@ -330,27 +358,19 @@ impl App {
                 _ => {}
             },
             Some(Screen::Configure(form)) => {
-                // Check for the user pressing Run / Cancel before reading
-                // for ordinary nav keys.
-                if form.cancelled {
-                    self.stack.pop();
-                    if self.stack.is_empty() {
-                        return true;
-                    }
-                    return false;
-                }
-                if let Some((plan, label, repeats)) = form.built_plan.take() {
-                    self.stack.pop();
-                    self.stack
-                        .push(Screen::Run(RunScreen::from_plan(plan, label, repeats)));
-                    return false;
-                }
+                // Process the keypress FIRST so a single Enter on
+                // [Run benchmark] / [Load template] both fires
+                // form.activate() AND triggers the resulting transition
+                // in the same handler invocation. Prior ordering checked
+                // state flags before the match, which made the user hit
+                // Enter twice (once to set the flag, once to act on it).
                 match code {
                     KeyCode::Esc => {
                         self.stack.pop();
                         if self.stack.is_empty() {
                             return true;
                         }
+                        return false;
                     }
                     KeyCode::Tab | KeyCode::Down => form.focus_next(),
                     KeyCode::BackTab | KeyCode::Up => form.focus_prev(),
@@ -371,6 +391,28 @@ impl App {
                     KeyCode::Char(c) => form.insert_char(c),
                     _ => {}
                 }
+                // State transitions the key may have triggered.
+                if form.cancelled {
+                    self.stack.pop();
+                    if self.stack.is_empty() {
+                        return true;
+                    }
+                    return false;
+                }
+                if std::mem::take(&mut form.pending_pick_template) {
+                    let start = std::env::current_dir()
+                        .unwrap_or_else(|_| PathBuf::from("."));
+                    self.stack.push(Screen::PickTemplateForLoad(
+                        PickConfigScreen::new(start),
+                    ));
+                    return false;
+                }
+                if let Some((plan, label, repeats)) = form.built_plan.take() {
+                    self.stack.pop();
+                    self.stack
+                        .push(Screen::Run(RunScreen::from_plan(plan, label, repeats)));
+                    return false;
+                }
             }
             Some(Screen::PickConfigForRun(picker)) => match code {
                 KeyCode::Esc | KeyCode::Char('q') => {
@@ -386,6 +428,27 @@ impl App {
                         // Replace picker with RunScreen.
                         self.stack.pop();
                         self.stack.push(Screen::Run(RunScreen::new(path)));
+                    }
+                }
+                _ => {}
+            },
+            Some(Screen::PickTemplateForLoad(picker)) => match code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    // Pop the picker without loading. The Configure
+                    // screen underneath is unchanged.
+                    self.stack.pop();
+                    if self.stack.is_empty() {
+                        return true;
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => picker.select_prev(),
+                KeyCode::Down | KeyCode::Char('j') => picker.select_next(),
+                KeyCode::Enter => {
+                    if let Some(path) = picker.activate_selected() {
+                        self.stack.pop();
+                        if let Some(Screen::Configure(form)) = self.stack.last_mut() {
+                            form.load_template_from(&path);
+                        }
                     }
                 }
                 _ => {}
