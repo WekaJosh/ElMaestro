@@ -85,7 +85,12 @@ pub enum RunEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpecStatus {
     Completed,
-    Failed(i32),
+    /// Engine ran but exited non-zero. Carries the stderr snippet so
+    /// the user can see why it failed without leaving the TUI (most
+    /// common cause on multi-host: dataset path not present on one of
+    /// the workers, ssh user without write permission on the mount,
+    /// service-port collision, etc.).
+    Failed(i32, String),
     /// Engine returned Err before producing a result. The string is the
     /// formatted anyhow chain (`{:#}`) so the TUI can show it to the
     /// user instead of just "error".
@@ -96,14 +101,17 @@ impl SpecStatus {
     pub fn label(&self) -> String {
         match self {
             SpecStatus::Completed => "completed".into(),
-            SpecStatus::Failed(rc) => format!("failed:{}", rc),
+            SpecStatus::Failed(rc, _) => format!("failed:{}", rc),
             SpecStatus::Error(_) => "error".into(),
         }
     }
 
+    /// Long-form detail for the Run-screen footer when this row is
+    /// highlighted. Some for both Failed and Error.
     pub fn error_detail(&self) -> Option<&str> {
         match self {
             SpecStatus::Error(msg) => Some(msg.as_str()),
+            SpecStatus::Failed(_, msg) if !msg.is_empty() => Some(msg.as_str()),
             _ => None,
         }
     }
@@ -216,7 +224,14 @@ fn execute_one_iteration(plan: &RunPlan, label: &str, tx: &Sender<RunEvent>) -> 
                         SpecStatus::Completed
                     } else {
                         failed += 1;
-                        SpecStatus::Failed(result.elbencho_exit_code)
+                        // result.errors already contains "elbencho
+                        // exited N" + the stderr tail (see
+                        // build_result). Join into one detail string so
+                        // the Run screen footer renders the actual
+                        // engine error when the user highlights a
+                        // failed row.
+                        let detail = result.errors.join(" | ");
+                        SpecStatus::Failed(result.elbencho_exit_code, detail)
                     };
                     let metrics = SpecMetrics::from_result(&result);
                     (st, Some(report_path), Some(result_path), Some(metrics))

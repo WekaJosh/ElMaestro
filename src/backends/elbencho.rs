@@ -141,9 +141,17 @@ impl Backend for ElbenchoBackend {
         }
 
         // rw mix -> phase flags.
+        //
+        // For pure reads we emit ONLY -r. The coordinator runs an explicit
+        // layout phase (write-only, fixed seq/1MiB/direct=1) ahead of
+        // every read-bearing workload, so the dataset is on disk before
+        // the master process invokes us with -r. Emitting -w -r here
+        // (legacy v0.x..v1.5 behavior) would re-write the dataset using
+        // the user's measured-workload block size, which is both wasteful
+        // and inconsistent with a "directly measure reads" intent.
         let primary_phase = match wl.rw_mix_pct_read {
             100 => {
-                argv.extend(["-w", "-r"].map(String::from));
+                argv.push("-r".into());
                 "read"
             }
             0 => {
@@ -551,7 +559,11 @@ mod tests {
     }
 
     #[test]
-    fn build_argv_pure_read_includes_both_phases() {
+    fn build_argv_pure_read_emits_only_r_flag() {
+        // Pre-v1.6 the read backend ALSO emitted -w so elbencho would
+        // self-create the dataset inline. v1.6 splits that out into an
+        // explicit layout phase (driven by the coordinator), so the
+        // measure invocation for a pure read must contain only -r.
         let tmp = TempDir::new().unwrap();
         let spec = make_spec(
             Target::Posix(PosixTarget {
@@ -565,8 +577,8 @@ mod tests {
         let (argv, phase) =
             ElbenchoBackend::new().build_argv(&spec, tmp.path(), "elbencho", None).unwrap();
         assert_eq!(phase, "read");
-        assert!(argv.contains(&"-w".into()));
         assert!(argv.contains(&"-r".into()));
+        assert!(!argv.contains(&"-w".into()));
         assert!(argv.contains(&"--direct".into()));
         assert!(argv.contains(&"--iodepth".into()));
     }

@@ -54,6 +54,45 @@ fn local_path(spec: &RunSpec) -> String {
         .unwrap_or_else(|| "elbencho".into())
 }
 
+/// True when the spec's measured workload needs files to exist before it
+/// runs (any reads in the mix) AND the target is file-based with sizing
+/// fully specified. False for pure writes (the measure phase IS the
+/// layout) and for S3 (object semantics, no pre-create needed).
+fn needs_layout(spec: &RunSpec) -> bool {
+    if spec.workload.rw_mix_pct_read == 0 {
+        return false;
+    }
+    if !matches!(spec.target, Target::Posix(_)) {
+        return false;
+    }
+    spec.workload.file_count.is_some() && spec.workload.file_size.is_some()
+}
+
+/// Synthesize a write-only spec used to lay out the dataset before the
+/// measured workload runs. Fixed parameters regardless of what the
+/// measure phase uses, so layout time is predictable and the dataset is
+/// always written linearly with direct IO:
+///   - pattern: seq
+///   - block_size: 1 MiB
+///   - direct_io: true
+///   - rw_mix_pct_read: 0 (pure write)
+///   - duration_s: None (run until N files of S bytes each are written)
+///
+/// Inherits threads_per_client / file_count / file_size from the user's
+/// spec so the resulting layout matches what the measure phase reads.
+fn layout_spec_for(spec: &RunSpec) -> RunSpec {
+    let mut s = spec.clone();
+    s.workload.rw_mix_pct_read = 0;
+    s.workload.pattern = "seq".into();
+    s.workload.block_size = 1024 * 1024;
+    s.workload.direct_io = true;
+    s.workload.duration_s = None;
+    // drop_caches / sync are irrelevant for layout-only — leave at user's
+    // choice. extra_flags pass through so user can force anything if they
+    // really need to.
+    s
+}
+
 /// Top-level entry: pick local or fan-out path.
 pub fn run(
     spec: &RunSpec,
@@ -78,11 +117,7 @@ pub fn run_locally(
     timeout_s: Option<u64>,
     backend: &dyn Backend,
 ) -> Result<RunResult> {
-    let raw_dir = spec_dir.join("raw");
-    std::fs::create_dir_all(&raw_dir)
-        .with_context(|| format!("creating {}", raw_dir.display()))?;
     let lp = local_path(spec);
-
     let version = backend.detect_version(&lp).with_context(|| {
         format!(
             "{} not found at {:?}; install it and ensure it's on PATH \
@@ -96,8 +131,6 @@ pub fn run_locally(
     if !support.supported {
         anyhow::bail!("{}", support.reason);
     }
-
-    // Engine-specific S3 feature check.
     if backend.name() == "elbencho" {
         if let Target::S3(_) = &spec.target {
             if !version.has("S3") {
@@ -111,18 +144,91 @@ pub fn run_locally(
 
     ensure_posix_dataset_dir(spec)?;
 
-    let (argv, primary_phase) = backend.build_argv(spec, &raw_dir, &lp, None)?;
-    let command_str = shell_quote_argv(&argv);
-
     let mut env: Vec<(String, String)> = std::env::vars().collect();
     if let Target::S3(t) = &spec.target {
         inject_s3_credentials(&mut env, &t.credentials_ref)?;
     }
 
+    // 1. Layout phase (if needed). Writes the dataset with fixed
+    //    seq/1MiB/direct=1 settings — predictable layout time, doesn't
+    //    cheat the read measurement by leaving sparse holes.
+    if needs_layout(spec) {
+        let layout_spec = layout_spec_for(spec);
+        let layout_dir = spec_dir.join("raw_layout");
+        let (exec, _) = run_one_local_pass(
+            &layout_spec,
+            &layout_dir,
+            &lp,
+            timeout_s,
+            backend,
+            &env,
+            None,
+        )?;
+        let layout_rc = exec.output.status.code().unwrap_or(-1);
+        if layout_rc != 0 {
+            anyhow::bail!(
+                "layout phase failed (exit={}); see {}/stderr.log: {}",
+                layout_rc,
+                layout_dir.display(),
+                String::from_utf8_lossy(&exec.output.stderr)
+                    .lines()
+                    .next()
+                    .unwrap_or("(no stderr)")
+            );
+        }
+    }
+
+    // 2. Measure phase: the user's workload.
+    let raw_dir = spec_dir.join("raw");
+    let (exec, primary_phase) =
+        run_one_local_pass(spec, &raw_dir, &lp, timeout_s, backend, &env, None)?;
+
+    let (phases, artifact_refs) = backend.parse_results(&raw_dir, &exec.command_str)?;
+    Ok(build_result(
+        spec,
+        backend,
+        version.version.as_deref(),
+        &version.features,
+        artifact_refs,
+        phases,
+        exec.started,
+        exec.finished,
+        exec.output.status.code().unwrap_or(-1),
+        primary_phase,
+        &String::from_utf8_lossy(&exec.output.stderr),
+    ))
+}
+
+struct PassExec {
+    output: std::process::Output,
+    command_str: String,
+    started: chrono::DateTime<Utc>,
+    finished: chrono::DateTime<Utc>,
+}
+
+/// One backend invocation. `hosts` is `Some(h1:p,h2:p,...)` for fan-out
+/// or None for local. Writes stdout.log / stderr.log into `raw_dir` so
+/// the in-TUI Report viewer and `elmaestro browse` can both inspect
+/// what happened.
+#[allow(clippy::too_many_arguments)]
+fn run_one_local_pass(
+    spec: &RunSpec,
+    raw_dir: &Path,
+    lp: &str,
+    timeout_s: Option<u64>,
+    backend: &dyn Backend,
+    env: &[(String, String)],
+    hosts: Option<&str>,
+) -> Result<(PassExec, String)> {
+    std::fs::create_dir_all(raw_dir)
+        .with_context(|| format!("creating {}", raw_dir.display()))?;
+    let (argv, primary_phase) = backend.build_argv(spec, raw_dir, lp, hosts)?;
+    let command_str = shell_quote_argv(&argv);
+
     let started = Utc::now();
     let mut command = Command::new(&argv[0]);
     command.args(&argv[1..]);
-    command.envs(env.clone());
+    command.envs(env.iter().cloned());
     let output = match timeout_s {
         Some(secs) => run_with_timeout(command, Duration::from_secs(secs))?,
         None => command
@@ -135,20 +241,19 @@ pub fn run_locally(
     if !output.stderr.is_empty() {
         std::fs::write(raw_dir.join("stderr.log"), &output.stderr)?;
     }
+    // Record the exact command we ran. The user's #1 debug ask is
+    // "what did elmaestro actually invoke?" — having this in the run
+    // dir means it's one `cat` away.
+    let _ = std::fs::write(raw_dir.join("command.txt"), &command_str);
 
-    let (phases, artifact_refs) = backend.parse_results(&raw_dir, &command_str)?;
-    Ok(build_result(
-        spec,
-        backend,
-        version.version.as_deref(),
-        &version.features,
-        artifact_refs,
-        phases,
-        started,
-        finished,
-        output.status.code().unwrap_or(-1),
+    Ok((
+        PassExec {
+            output,
+            command_str,
+            started,
+            finished,
+        },
         primary_phase,
-        &String::from_utf8_lossy(&output.stderr),
     ))
 }
 
@@ -158,10 +263,7 @@ async fn run_fanout(
     timeout_s: Option<u64>,
     backend: &dyn Backend,
 ) -> Result<RunResult> {
-    let raw_dir = spec_dir.join("raw");
-    std::fs::create_dir_all(&raw_dir)?;
     let lp = local_path(spec);
-
     let version = backend.detect_version(&lp).with_context(|| {
         format!(
             "local {} not found at {:?}; the coordinator machine \
@@ -174,23 +276,112 @@ async fn run_fanout(
     if !support.supported {
         anyhow::bail!("{}", support.reason);
     }
-    ensure_posix_dataset_dir(spec)?;
+    // Intentionally do NOT ensure the dataset dir on the master here.
+    // In fan-out the workers do the writes; the master may not even
+    // have the mount, and creating an empty dir on its local fs would
+    // be a footgun (silently masks a missing mount on the workers).
 
     let mut env: Vec<(String, String)> = std::env::vars().collect();
     if let Target::S3(t) = &spec.target {
         inject_s3_credentials(&mut env, &t.credentials_ref)?;
     }
 
+    // Bring up engine services on every worker ONCE for both phases.
+    // Tearing down between layout and measure would just re-pay the
+    // SSH + service-start cost.
     let (endpoints, guard) =
         crate::engine::service::bring_up(backend, &spec.clients, Duration::from_secs(15)).await?;
-
     let hosts = crate::engine::service::hosts_arg(&endpoints);
-    let (argv, primary_phase) = backend.build_argv(spec, &raw_dir, &lp, Some(&hosts))?;
+
+    // 1. Layout phase: explicit dataset write before the measured workload.
+    let layout_err: Option<String> = if needs_layout(spec) {
+        let layout_spec = layout_spec_for(spec);
+        let layout_dir = spec_dir.join("raw_layout");
+        match run_one_fanout_pass(
+            &layout_spec,
+            &layout_dir,
+            &lp,
+            timeout_s,
+            backend,
+            &env,
+            &hosts,
+        )
+        .await
+        {
+            Ok((exec, _)) => {
+                let rc = exec.output.status.code().unwrap_or(-1);
+                if rc != 0 {
+                    let snippet = String::from_utf8_lossy(&exec.output.stderr)
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .take(5)
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    Some(format!(
+                        "layout phase failed (exit={}, see {}/stderr.log): {}",
+                        rc,
+                        layout_dir.display(),
+                        snippet
+                    ))
+                } else {
+                    None
+                }
+            }
+            Err(e) => Some(format!("{:#}", e)),
+        }
+    } else {
+        None
+    };
+    if let Some(msg) = layout_err {
+        guard.shutdown().await;
+        anyhow::bail!(msg);
+    }
+
+    // 2. Measure phase.
+    let raw_dir = spec_dir.join("raw");
+    let pass_res =
+        run_one_fanout_pass(spec, &raw_dir, &lp, timeout_s, backend, &env, &hosts).await;
+    guard.shutdown().await;
+    let (exec, primary_phase) = pass_res?;
+
+    let (phases, artifact_refs) = backend.parse_results(&raw_dir, &exec.command_str)?;
+    Ok(build_result(
+        spec,
+        backend,
+        version.version.as_deref(),
+        &version.features,
+        artifact_refs,
+        phases,
+        exec.started,
+        exec.finished,
+        exec.output.status.code().unwrap_or(-1),
+        primary_phase,
+        &String::from_utf8_lossy(&exec.output.stderr),
+    ))
+}
+
+/// One fan-out master invocation. Runs the engine binary locally (or in
+/// the coordinator container), pointed at the live services via --hosts.
+/// Uses spawn_blocking so we don't stall the current-thread runtime that
+/// the guard's shutdown task still lives on.
+#[allow(clippy::too_many_arguments)]
+async fn run_one_fanout_pass(
+    spec: &RunSpec,
+    raw_dir: &Path,
+    lp: &str,
+    timeout_s: Option<u64>,
+    backend: &dyn Backend,
+    env: &[(String, String)],
+    hosts: &str,
+) -> Result<(PassExec, String)> {
+    std::fs::create_dir_all(raw_dir)
+        .with_context(|| format!("creating {}", raw_dir.display()))?;
+    let (argv, primary_phase) = backend.build_argv(spec, raw_dir, lp, Some(hosts))?;
     let command_str = shell_quote_argv(&argv);
 
     let started = Utc::now();
     let argv_owned = argv.clone();
-    let env_owned = env.clone();
+    let env_owned: Vec<(String, String)> = env.to_vec();
     let output_res = tokio::task::spawn_blocking(move || {
         let mut command = Command::new(&argv_owned[0]);
         command.args(&argv_owned[1..]);
@@ -207,26 +398,20 @@ async fn run_fanout(
     let output = output_res?;
     let finished = Utc::now();
 
-    guard.shutdown().await;
-
     std::fs::write(raw_dir.join("stdout.log"), &output.stdout)?;
     if !output.stderr.is_empty() {
         std::fs::write(raw_dir.join("stderr.log"), &output.stderr)?;
     }
+    let _ = std::fs::write(raw_dir.join("command.txt"), &command_str);
 
-    let (phases, artifact_refs) = backend.parse_results(&raw_dir, &command_str)?;
-    Ok(build_result(
-        spec,
-        backend,
-        version.version.as_deref(),
-        &version.features,
-        artifact_refs,
-        phases,
-        started,
-        finished,
-        output.status.code().unwrap_or(-1),
+    Ok((
+        PassExec {
+            output,
+            command_str,
+            started,
+            finished,
+        },
         primary_phase,
-        &String::from_utf8_lossy(&output.stderr),
     ))
 }
 
