@@ -183,6 +183,16 @@ pub fn run_locally(
     let (exec, primary_phase) =
         run_one_local_pass(spec, &raw_dir, &lp, timeout_s, backend, &env, None)?;
 
+    // Gather hardware facts for the (single, local) client. Best-effort:
+    // a None just means the report shows no system panel for this host.
+    let mut client_systems: HashMap<String, crate::results::schema::SystemInfo> =
+        HashMap::new();
+    if let Some(c) = spec.clients.first() {
+        if let Some(info) = crate::engine::sysinfo::gather_local_blocking(&c.host) {
+            client_systems.insert(c.host.clone(), info);
+        }
+    }
+
     let (phases, artifact_refs) = backend.parse_results(&raw_dir, &exec.command_str)?;
     Ok(build_result(
         spec,
@@ -196,6 +206,7 @@ pub fn run_locally(
         exec.output.status.code().unwrap_or(-1),
         primary_phase,
         &String::from_utf8_lossy(&exec.output.stderr),
+        &client_systems,
     ))
 }
 
@@ -344,6 +355,24 @@ async fn run_fanout(
     guard.shutdown().await;
     let (exec, primary_phase) = pass_res?;
 
+    // Gather hardware facts for every worker in parallel. Best-effort
+    // and cached per host, so a sweep only probes each host once. A
+    // failure to gather never affects the run result.
+    let mut sys_tasks = Vec::with_capacity(spec.clients.len());
+    for c in &spec.clients {
+        let c = c.clone();
+        sys_tasks.push(tokio::spawn(async move {
+            (c.host.clone(), crate::engine::sysinfo::gather(&c).await)
+        }));
+    }
+    let mut client_systems: HashMap<String, crate::results::schema::SystemInfo> =
+        HashMap::new();
+    for t in sys_tasks {
+        if let Ok((host, Some(info))) = t.await {
+            client_systems.insert(host, info);
+        }
+    }
+
     let (phases, artifact_refs) = backend.parse_results(&raw_dir, &exec.command_str)?;
     Ok(build_result(
         spec,
@@ -357,6 +386,7 @@ async fn run_fanout(
         exec.output.status.code().unwrap_or(-1),
         primary_phase,
         &String::from_utf8_lossy(&exec.output.stderr),
+        &client_systems,
     ))
 }
 
@@ -436,6 +466,7 @@ fn build_result(
     exit_code: i32,
     primary_phase: String,
     stderr_tail: &str,
+    client_systems: &HashMap<String, crate::results::schema::SystemInfo>,
 ) -> RunResult {
     let tgt_snap = match &spec.target {
         Target::Posix(t) => TargetSnapshot {
@@ -506,6 +537,7 @@ fn build_result(
             host: c.host.clone(),
             elbencho_version: engine_version.map(|s| s.to_string()),
             features: engine_features.to_vec(),
+            system: client_systems.get(&c.host).cloned(),
         })
         .collect();
 

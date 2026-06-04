@@ -531,6 +531,7 @@ impl App {
                 }
                 KeyCode::Up | KeyCode::Char('k') => r.select_prev(),
                 KeyCode::Down | KeyCode::Char('j') => r.select_next(),
+                KeyCode::Char('s') | KeyCode::Char('S') => r.toggle_systems(),
                 KeyCode::Char('b') | KeyCode::Char('B') => r.open_html(),
                 _ => {}
             },

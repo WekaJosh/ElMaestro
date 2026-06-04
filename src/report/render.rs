@@ -34,7 +34,12 @@ struct SinglePage {
     direct_io: bool,
     total_concurrency: u64,
     command: String,
+    file_size_fmt: String,
+    file_count_fmt: String,
+    duration_opt_fmt: String,
     tiles: Vec<Tile>,
+    clients: Vec<ClientRow>,
+    has_clients: bool,
     throughput_json: String,
     latency_json: String,
     has_latency: bool,
@@ -46,6 +51,21 @@ struct Tile {
     formatted: String,
     unit: String,
     subtle: bool,
+}
+
+/// One row in the "Client systems" table. Strings are pre-formatted so
+/// the template stays dumb; missing facts render as "—".
+#[derive(Clone)]
+struct ClientRow {
+    host: String,
+    engine_version: String,
+    cpu: String,
+    cores: String,
+    ram: String,
+    mem: String,
+    nics: String,
+    os: String,
+    kernel: String,
 }
 
 /// Render one Result to a self-contained HTML file. Returns the path written.
@@ -63,6 +83,9 @@ pub fn render_single(result: &RunResult, out_path: &Path, run_label: Option<&str
     let label = run_label
         .map(String::from)
         .unwrap_or_else(|| format!("{} · {}", result.target.name, result.workload.name));
+
+    let clients = client_rows(result);
+    let has_clients = !clients.is_empty();
 
     let page = SinglePage {
         run_label: label,
@@ -86,7 +109,24 @@ pub fn render_single(result: &RunResult, out_path: &Path, run_label: Option<&str
         direct_io: result.workload.direct_io,
         total_concurrency: result.workload.total_concurrency,
         command: result.elbencho.command.clone(),
+        file_size_fmt: result
+            .workload
+            .file_size
+            .map(opt_bytes)
+            .unwrap_or_else(|| "—".into()),
+        file_count_fmt: result
+            .workload
+            .file_count
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "—".into()),
+        duration_opt_fmt: result
+            .workload
+            .duration_s
+            .map(|d| format!("{}s", d))
+            .unwrap_or_else(|| "(run to completion)".into()),
         tiles,
+        clients,
+        has_clients,
         throughput_json,
         latency_json,
         has_latency,
@@ -98,6 +138,77 @@ pub fn render_single(result: &RunResult, out_path: &Path, run_label: Option<&str
     }
     std::fs::write(out_path, html)?;
     Ok(())
+}
+
+/// Build per-client rows for the "Client systems" table. Always includes
+/// a row per client (so the host + engine version show even when hardware
+/// gathering came up empty), filling unknown facts with "—".
+fn client_rows(result: &RunResult) -> Vec<ClientRow> {
+    use crate::engine::sysinfo::{fmt_mem, fmt_nic_speed};
+    let dash = || "—".to_string();
+    result
+        .clients
+        .iter()
+        .map(|c| {
+            let sys = c.system.as_ref();
+            let cpu = sys
+                .and_then(|s| s.cpu_model.clone())
+                .unwrap_or_else(dash);
+            let cores = sys
+                .and_then(|s| s.cpu_count)
+                .map(|n| n.to_string())
+                .unwrap_or_else(dash);
+            let ram = sys
+                .and_then(|s| s.mem_total_bytes)
+                .map(fmt_mem)
+                .unwrap_or_else(dash);
+            let mem = match sys {
+                Some(s) => match (&s.mem_type, &s.mem_speed) {
+                    (Some(t), Some(sp)) => format!("{} {}", t, sp),
+                    (Some(t), None) => t.clone(),
+                    (None, Some(sp)) => sp.clone(),
+                    (None, None) => dash(),
+                },
+                None => dash(),
+            };
+            let nics = match sys {
+                Some(s) if !s.nics.is_empty() => s
+                    .nics
+                    .iter()
+                    .map(|n| format!("{} {}", n.name, fmt_nic_speed(n.speed_mbps)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                _ => dash(),
+            };
+            ClientRow {
+                host: c.host.clone(),
+                engine_version: c.elbencho_version.clone().unwrap_or_else(dash),
+                cpu,
+                cores,
+                ram,
+                mem,
+                nics,
+                os: sys.and_then(|s| s.os.clone()).unwrap_or_else(dash),
+                kernel: sys.and_then(|s| s.kernel.clone()).unwrap_or_else(dash),
+            }
+        })
+        .collect()
+}
+
+/// Format a byte count for the job-options table (KiB/MiB/GiB).
+fn opt_bytes(n: u64) -> String {
+    const KIB: u64 = 1 << 10;
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    if n >= GIB {
+        format!("{:.2} GiB", n as f64 / GIB as f64)
+    } else if n >= MIB {
+        format!("{:.0} MiB", n as f64 / MIB as f64)
+    } else if n >= KIB {
+        format!("{:.0} KiB", n as f64 / KIB as f64)
+    } else {
+        format!("{} B", n)
+    }
 }
 
 fn headline_tiles(result: &RunResult) -> Vec<Tile> {

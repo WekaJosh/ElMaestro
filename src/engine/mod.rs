@@ -4,5 +4,6 @@ pub mod check;
 pub mod coordinator;
 pub mod service;
 pub mod ssh;
+pub mod sysinfo;
 
 pub use coordinator::{run as run_spec, CoordinatorError};

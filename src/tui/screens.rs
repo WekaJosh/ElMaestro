@@ -1230,6 +1230,9 @@ pub struct ReportScreen {
     /// the 'b' shortcut).
     source_path: PathBuf,
     message: Option<String>,
+    /// When true, the flex panel shows the client systems table instead
+    /// of the throughput-across-sweep chart. Toggled with 's'.
+    show_systems: bool,
 }
 
 impl ReportScreen {
@@ -1240,10 +1243,15 @@ impl ReportScreen {
             selected: 0,
             source_path: result_path.clone(),
             message: None,
+            show_systems: false,
         };
         s.load(&result_path);
         s.scan_siblings(&result_path);
         s
+    }
+
+    pub fn toggle_systems(&mut self) {
+        self.show_systems = !self.show_systems;
     }
 
     fn load(&mut self, p: &Path) {
@@ -1372,8 +1380,92 @@ impl ReportScreen {
 
         self.render_metrics_row(frame, chunks[0], &result);
         self.render_meta_row(frame, chunks[1], &result);
-        self.render_sweep_chart(frame, chunks[2]);
+        if self.show_systems {
+            self.render_systems_panel(frame, chunks[2], &result);
+        } else {
+            self.render_sweep_chart(frame, chunks[2]);
+        }
         self.render_footer(frame, chunks[3]);
+    }
+
+    /// Client systems table: per host, CPU / cores / RAM / mem / NICs /
+    /// OS. Toggled with 's'. Falls back to a hint when no hardware facts
+    /// were gathered (e.g. all clients local with probe failure).
+    fn render_systems_panel(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        result: &crate::results::schema::Result,
+    ) {
+        use crate::engine::sysinfo::{fmt_mem, fmt_nic_speed};
+        let header = Row::new(vec![
+            "host", "CPU", "cores", "RAM", "memory", "NICs", "OS",
+        ])
+        .style(
+            Style::default()
+                .fg(Color::Rgb(0x8b, 0x94, 0x9e))
+                .add_modifier(Modifier::BOLD),
+        );
+        let dash = || "—".to_string();
+        let rows: Vec<Row> = result
+            .clients
+            .iter()
+            .map(|c| {
+                let sys = c.system.as_ref();
+                let cpu = sys.and_then(|s| s.cpu_model.clone()).unwrap_or_else(dash);
+                let cores = sys
+                    .and_then(|s| s.cpu_count)
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(dash);
+                let ram = sys
+                    .and_then(|s| s.mem_total_bytes)
+                    .map(fmt_mem)
+                    .unwrap_or_else(dash);
+                let mem = match sys {
+                    Some(s) => match (&s.mem_type, &s.mem_speed) {
+                        (Some(t), Some(sp)) => format!("{} {}", t, sp),
+                        (Some(t), None) => t.clone(),
+                        (None, Some(sp)) => sp.clone(),
+                        (None, None) => dash(),
+                    },
+                    None => dash(),
+                };
+                let nics = match sys {
+                    Some(s) if !s.nics.is_empty() => s
+                        .nics
+                        .iter()
+                        .map(|n| format!("{} {}", n.name, fmt_nic_speed(n.speed_mbps)))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    _ => dash(),
+                };
+                let os = sys.and_then(|s| s.os.clone()).unwrap_or_else(dash);
+                Row::new(vec![
+                    Cell::from(c.host.clone()),
+                    Cell::from(cpu),
+                    Cell::from(cores),
+                    Cell::from(ram),
+                    Cell::from(mem),
+                    Cell::from(nics),
+                    Cell::from(os),
+                ])
+            })
+            .collect();
+        let widths = [
+            Constraint::Length(18),
+            Constraint::Min(22),
+            Constraint::Length(6),
+            Constraint::Length(11),
+            Constraint::Length(16),
+            Constraint::Min(16),
+            Constraint::Min(14),
+        ];
+        let table = Table::new(rows, widths).header(header).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Client systems  ('s' back to chart) "),
+        );
+        frame.render_widget(table, area);
     }
 
     fn title_line(&self) -> String {
@@ -1610,7 +1702,7 @@ impl ReportScreen {
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
         let msg = self.message.clone().unwrap_or_else(|| {
-            "[↑/↓] cycle specs · [b] open report.html · [esc] back".into()
+            "[↑/↓] cycle specs · [s] systems · [b] open report.html · [esc] back".into()
         });
         frame.render_widget(
             Paragraph::new(Span::styled(

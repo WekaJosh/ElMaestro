@@ -59,6 +59,44 @@ pub struct ClientInfo {
     pub elbencho_version: Option<String>,
     #[serde(default)]
     pub features: Vec<String>,
+    /// Hardware facts gathered from this client at run time (CPU, RAM,
+    /// NICs, OS). None when gathering failed or wasn't attempted.
+    #[serde(default)]
+    pub system: Option<SystemInfo>,
+}
+
+/// A single network interface's reported link speed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NicInfo {
+    pub name: String,
+    /// Link speed in Mbit/s as reported by /sys/class/net/<if>/speed.
+    pub speed_mbps: u64,
+}
+
+/// Hardware / OS facts for one client, gathered at run time. Every field
+/// is optional because the gather command degrades gracefully when a
+/// tool isn't installed or a fact needs root (e.g. DIMM speed via
+/// dmidecode).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SystemInfo {
+    #[serde(default)]
+    pub cpu_model: Option<String>,
+    #[serde(default)]
+    pub cpu_count: Option<u32>,
+    #[serde(default)]
+    pub mem_total_bytes: Option<u64>,
+    /// e.g. "DDR4", "DDR5" (dmidecode, root-only — often None).
+    #[serde(default)]
+    pub mem_type: Option<String>,
+    /// e.g. "3200 MT/s" (dmidecode, root-only — often None).
+    #[serde(default)]
+    pub mem_speed: Option<String>,
+    #[serde(default)]
+    pub os: Option<String>,
+    #[serde(default)]
+    pub kernel: Option<String>,
+    #[serde(default)]
+    pub nics: Vec<NicInfo>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

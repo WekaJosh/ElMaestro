@@ -121,6 +121,59 @@
 {% endif %}
 
 <section>
+  <h2>Job options</h2>
+  <table class="meta">
+    <tr><th>pattern</th><td>{{ pattern }}</td></tr>
+    <tr><th>block_size</th><td>{{ block_size }} bytes</td></tr>
+    <tr><th>rw_mix_pct_read</th><td>{{ rw_mix_pct_read }}% read</td></tr>
+    <tr><th>threads_per_client</th><td>{{ threads_per_client }}</td></tr>
+    <tr><th>io_depth</th><td>{{ io_depth }}</td></tr>
+    <tr><th>direct_io</th><td>{{ direct_io }}</td></tr>
+    <tr><th>file_size</th><td>{{ file_size_fmt }}</td></tr>
+    <tr><th>file_count</th><td>{{ file_count_fmt }}</td></tr>
+    <tr><th>duration</th><td>{{ duration_opt_fmt }}</td></tr>
+    <tr><th>total_concurrency</th><td>{{ total_concurrency }}</td></tr>
+    <tr><th>command</th><td><code>{{ command }}</code></td></tr>
+  </table>
+</section>
+
+{% if has_clients %}
+<section>
+  <h2>Client systems</h2>
+  <table class="meta">
+    <thead>
+      <tr>
+        <th style="width:auto">host</th>
+        <th style="width:auto">CPU</th>
+        <th style="width:auto">cores</th>
+        <th style="width:auto">RAM</th>
+        <th style="width:auto">memory</th>
+        <th style="width:auto">NICs</th>
+        <th style="width:auto">OS</th>
+        <th style="width:auto">kernel</th>
+        <th style="width:auto">engine</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for c in clients %}
+      <tr>
+        <td><strong>{{ c.host }}</strong></td>
+        <td>{{ c.cpu }}</td>
+        <td>{{ c.cores }}</td>
+        <td>{{ c.ram }}</td>
+        <td>{{ c.mem }}</td>
+        <td>{{ c.nics }}</td>
+        <td>{{ c.os }}</td>
+        <td>{{ c.kernel }}</td>
+        <td>{{ c.engine_version }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+<section>
   <h2>Run details</h2>
   <table class="meta">
     <tr><th>run_id</th><td><code>{{ run_id }}</code></td></tr>
@@ -131,14 +184,6 @@
     <tr><th>finished_at</th><td>{{ finished_at }}</td></tr>
     <tr><th>duration_s</th><td>{{ duration_s_fmt }}</td></tr>
     <tr><th>exit_code</th><td>{{ exit_code }}</td></tr>
-    <tr><th>block_size</th><td>{{ block_size }} bytes</td></tr>
-    <tr><th>threads_per_client</th><td>{{ threads_per_client }}</td></tr>
-    <tr><th>io_depth</th><td>{{ io_depth }}</td></tr>
-    <tr><th>pattern</th><td>{{ pattern }}</td></tr>
-    <tr><th>rw_mix_pct_read</th><td>{{ rw_mix_pct_read }}</td></tr>
-    <tr><th>direct_io</th><td>{{ direct_io }}</td></tr>
-    <tr><th>total_concurrency</th><td>{{ total_concurrency }}</td></tr>
-    <tr><th>command</th><td><code>{{ command }}</code></td></tr>
   </table>
 </section>
 
