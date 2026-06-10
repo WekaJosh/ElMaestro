@@ -38,20 +38,44 @@ pub struct BgProcess {
     pub log_file: String,
 }
 
+/// True when the client authenticates with a password (non-empty
+/// ssh_password). Drives both the argv shape and the SSHPASS env var.
+fn uses_password(client: &ClientHost) -> bool {
+    client
+        .ssh_password
+        .as_deref()
+        .map(|p| !p.is_empty())
+        .unwrap_or(false)
+}
+
 /// Build the base ssh argv for a ClientHost.
 ///
-/// Honors ssh_port, ssh_user, ssh_key. Adds BatchMode=yes (never prompt for
-/// password) and ConnectTimeout=10 (fail fast on dead hosts).
+/// Honors ssh_port, ssh_user, ssh_key, ssh_jump, ssh_password. Key-auth
+/// hosts get BatchMode=yes (never prompt). Password hosts are wrapped in
+/// `sshpass -e` instead — BatchMode would disable password auth — with
+/// the password delivered via the SSHPASS env var by SshRunner, never
+/// argv, so it can't leak through `ps`.
 pub fn ssh_base_argv(client: &ClientHost) -> Vec<String> {
-    let mut argv: Vec<String> = vec![
-        "ssh".into(),
-        "-o".into(),
-        "BatchMode=yes".into(),
-        "-o".into(),
-        "ConnectTimeout=10".into(),
-        "-o".into(),
-        "StrictHostKeyChecking=accept-new".into(),
-    ];
+    let mut argv: Vec<String> = if uses_password(client) {
+        vec![
+            "sshpass".into(),
+            "-e".into(),
+            "ssh".into(),
+            "-o".into(),
+            "NumberOfPasswordPrompts=1".into(),
+        ]
+    } else {
+        vec!["ssh".into(), "-o".into(), "BatchMode=yes".into()]
+    };
+    argv.extend(
+        [
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+        ]
+        .map(String::from),
+    );
     if client.ssh_port != 22 {
         argv.push("-p".into());
         argv.push(client.ssh_port.to_string());
@@ -111,16 +135,22 @@ impl SshRunner {
         command.args(&base[1..]);
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
+        if let Some(pw) = self.client.ssh_password.as_deref().filter(|p| !p.is_empty()) {
+            // sshpass -e reads the password from SSHPASS. Env, not argv:
+            // argv is visible to every user on the box via `ps`.
+            command.env("SSHPASS", pw);
+        }
         let fut = command.output();
-        let out = match timeout {
+        let out_res = match timeout {
             Some(d) => tokio::time::timeout(d, fut)
                 .await
                 .map_err(|_| SshError::Failed {
                     host: self.client.host.clone(),
                     message: format!("timeout running {:?}", cmd_str),
-                })??,
-            None => fut.await?,
+                })?,
+            None => fut.await,
         };
+        let out = out_res.map_err(|e| map_spawn_error(e, &base[0], &self.client.host))?;
         Ok(SshResult {
             exit_status: out.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -219,6 +249,21 @@ pub async fn health_check(client: &ClientHost) -> Result<()> {
     Ok(())
 }
 
+/// Turn a process-spawn failure into something actionable. The big one:
+/// a password-auth client needs `sshpass` on the coordinator, and a bare
+/// "No such file or directory" doesn't tell the user that.
+fn map_spawn_error(e: std::io::Error, binary: &str, host: &str) -> anyhow::Error {
+    if e.kind() == std::io::ErrorKind::NotFound && binary == "sshpass" {
+        return anyhow!(
+            "ssh password auth for {} requires `sshpass` on this machine; \
+             install it (apt/dnf install sshpass · brew install sshpass) \
+             or switch the host to key auth",
+            host
+        );
+    }
+    anyhow!("spawning {}: {}", binary, e)
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n {
         s.to_string()
@@ -270,6 +315,57 @@ mod tests {
         assert!(argv.iter().any(|a| a == "-i"));
         assert!(argv.iter().any(|a| a == "/tmp/key"));
         assert!(argv.iter().any(|a| a == "bench@h"));
+    }
+
+    #[test]
+    fn base_argv_password_wraps_with_sshpass_and_drops_batchmode() {
+        let argv = ssh_base_argv(&ClientHost {
+            host: "h".into(),
+            ssh_password: Some("secret".into()),
+            ..Default::default()
+        });
+        assert_eq!(argv[0], "sshpass");
+        assert_eq!(argv[1], "-e");
+        assert_eq!(argv[2], "ssh");
+        // BatchMode would disable password auth.
+        assert!(!argv.iter().any(|a| a == "BatchMode=yes"));
+        assert!(argv.iter().any(|a| a == "NumberOfPasswordPrompts=1"));
+        // The password itself must NEVER appear in argv (ps would show it).
+        assert!(!argv.iter().any(|a| a.contains("secret")));
+        // Common hardening flags stay.
+        assert!(argv.iter().any(|a| a == "ConnectTimeout=10"));
+    }
+
+    #[test]
+    fn base_argv_blank_password_means_key_auth() {
+        let argv = ssh_base_argv(&ClientHost {
+            host: "h".into(),
+            ssh_password: Some("   ".into()),
+            ..Default::default()
+        });
+        // Whitespace-only is not a password... but trim happens at the
+        // form layer; here only the empty string disables it. A literal
+        // whitespace password is technically valid, so it wraps.
+        assert_eq!(argv[0], "sshpass");
+
+        let argv = ssh_base_argv(&ClientHost {
+            host: "h".into(),
+            ssh_password: Some("".into()),
+            ..Default::default()
+        });
+        assert_eq!(argv[0], "ssh");
+        assert!(argv.iter().any(|a| a == "BatchMode=yes"));
+    }
+
+    #[test]
+    fn base_argv_jump_host_with_port_passes_through() {
+        let argv = ssh_base_argv(&ClientHost {
+            host: "internal".into(),
+            ssh_jump: Some("user@bastion:2222".into()),
+            ..Default::default()
+        });
+        let j_idx = argv.iter().position(|a| a == "-J").expect("-J flag");
+        assert_eq!(argv[j_idx + 1], "user@bastion:2222");
     }
 
     #[test]

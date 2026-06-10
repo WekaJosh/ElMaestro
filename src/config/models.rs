@@ -57,9 +57,17 @@ pub struct ClientHost {
     pub ssh_key: Option<PathBuf>,
     /// Optional jump host (ssh -J). Lets a user on their laptop reach
     /// internal workers via a bastion. Accepts `host`, `user@host`,
-    /// or `user@host:port`.
+    /// or `user@host:port` (non-22 bastion port).
     #[serde(default)]
     pub ssh_jump: Option<String>,
+    /// Optional SSH password for hosts without key auth. Requires
+    /// `sshpass` on the coordinator (the password is handed to ssh via
+    /// the SSHPASS env var, never argv). Stored in plain text in YAML /
+    /// templates — prefer keys where possible. With a jump host, the
+    /// password applies to the TARGET hosts; the bastion must use
+    /// keys/agent (sshpass can only answer one prompt).
+    #[serde(default)]
+    pub ssh_password: Option<String>,
     /// Path to the engine binary on this client (historical name; works
     /// for both elbencho and fio).
     #[serde(default = "default_engine_path")]
@@ -76,6 +84,7 @@ impl Default for ClientHost {
             ssh_port: default_ssh_port(),
             ssh_key: None,
             ssh_jump: None,
+            ssh_password: None,
             elbencho_path: default_engine_path(),
             service_port: default_service_port(),
         }

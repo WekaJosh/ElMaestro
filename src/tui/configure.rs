@@ -598,11 +598,18 @@ fn default_fields() -> Vec<Field> {
             hint: "(path to private key; supports ~)",
         },
         Field::Text {
+            label: "SSH password",
+            value: String::new(),
+            cursor: 0,
+            placeholder: "blank = key auth",
+            hint: "(needs sshpass on this machine; saved in plain text — prefer keys)",
+        },
+        Field::Text {
             label: "Jump host",
             value: String::new(),
             cursor: 0,
-            placeholder: "user@bastion.example.com",
-            hint: "(optional ssh -J jumphost; reach internal workers via bastion)",
+            placeholder: "user@bastion.example.com:2222",
+            hint: "(ssh -J bastion; host, user@host, or user@host:port for non-22)",
         },
         Field::Text {
             label: "Service port",
@@ -788,6 +795,7 @@ fn build_plan(fields: &[Field]) -> Result<(RunPlan, String, usize)> {
     let workers = field_text(fields, "Workers (hosts)").trim().to_string();
     let ssh_user = field_text(fields, "SSH user").trim().to_string();
     let ssh_key = field_text(fields, "SSH key").trim().to_string();
+    let ssh_password = field_text(fields, "SSH password").trim().to_string();
     let jump_host = field_text(fields, "Jump host").trim().to_string();
     let svc_port_raw = field_text(fields, "Service port").trim().to_string();
 
@@ -846,6 +854,11 @@ fn build_plan(fields: &[Field]) -> Result<(RunPlan, String, usize)> {
                     None
                 } else {
                     Some(jump_host.clone())
+                },
+                ssh_password: if ssh_password.is_empty() {
+                    None
+                } else {
+                    Some(ssh_password.clone())
                 },
                 ..Default::default()
             };
@@ -1093,6 +1106,7 @@ fn apply_plan_to_fields(fields: &mut [Field], plan: &crate::config::RunPlan) -> 
         set_text(fields, "Workers (hosts)", "");
         set_text(fields, "SSH user", "");
         set_text(fields, "SSH key", "");
+        set_text(fields, "SSH password", "");
         set_text(fields, "Jump host", "");
         set_text(fields, "Service port", "");
     } else {
@@ -1121,6 +1135,11 @@ fn apply_plan_to_fields(fields: &mut [Field], plan: &crate::config::RunPlan) -> 
                 .unwrap_or_default(),
         );
         set_text(fields, "Jump host", first.ssh_jump.as_deref().unwrap_or(""));
+        set_text(
+            fields,
+            "SSH password",
+            first.ssh_password.as_deref().unwrap_or(""),
+        );
         let engine_default = match plan.engine {
             crate::config::Engine::Elbencho => 1611,
             crate::config::Engine::Fio => 8765,
@@ -1299,6 +1318,26 @@ mod tests {
         let (plan, _, _) = build_plan(&fields).expect("plan should validate");
         assert_eq!(plan.clients.len(), 1);
         assert_eq!(plan.clients[0].host, "localhost");
+    }
+
+    #[test]
+    fn ssh_password_propagates_to_every_worker() {
+        let mut fields = default_fields();
+        set_text(&mut fields, "Workers (hosts)", "w1,w2");
+        set_text(&mut fields, "SSH password", "hunter2");
+        let (plan, _, _) = build_plan(&fields).expect("plan should validate");
+        assert_eq!(plan.clients.len(), 2);
+        for c in &plan.clients {
+            assert_eq!(c.ssh_password.as_deref(), Some("hunter2"));
+        }
+    }
+
+    #[test]
+    fn blank_ssh_password_stays_none() {
+        let mut fields = default_fields();
+        set_text(&mut fields, "Workers (hosts)", "w1");
+        let (plan, _, _) = build_plan(&fields).expect("plan should validate");
+        assert!(plan.clients[0].ssh_password.is_none());
     }
 
     #[test]
