@@ -437,6 +437,28 @@ fn default_clients() -> Vec<ClientHost> {
 }
 
 impl RunPlan {
+    /// Engine-aware default repair. The serde defaults for ClientHost
+    /// (binary path "elbencho", service port 1611) are elbencho's, which
+    /// is wrong when `engine: fio` — the master would invoke an elbencho
+    /// binary with fio flags ("unrecognised option '--output-format=json'").
+    /// Swap any client still carrying the untouched elbencho defaults to
+    /// fio's ("fio", port 8765). Explicitly-set values are left alone: a
+    /// user pointing the fio engine at a binary literally named
+    /// "elbencho" has no sane meaning, so the swap is safe.
+    pub fn normalize_engine_defaults(&mut self) {
+        if self.engine != Engine::Fio {
+            return;
+        }
+        for c in &mut self.clients {
+            if c.elbencho_path == "elbencho" {
+                c.elbencho_path = "fio".into();
+            }
+            if c.service_port == 1611 {
+                c.service_port = 8765;
+            }
+        }
+    }
+
     /// Cross-field validation: target/workload names unique; runs/sweeps
     /// reference existing names; per-target and per-workload internal
     /// validation.

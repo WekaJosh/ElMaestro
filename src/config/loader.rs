@@ -61,6 +61,7 @@ pub fn load(path: &Path) -> Result<RunPlan> {
     let mut plan: RunPlan = serde_yaml::from_str(&expanded)
         .with_context(|| format!("parsing YAML in {}", path.display()))?;
     expand_client_brace_ranges(&mut plan);
+    plan.normalize_engine_defaults();
     plan.validate()
         .with_context(|| format!("validating {}", path.display()))?;
     Ok(plan)
@@ -150,6 +151,76 @@ runs:
         assert_eq!(plan.workloads.len(), 1);
         assert_eq!(plan.runs.len(), 1);
         assert_eq!(plan.engine.to_string(), "elbencho");
+    }
+
+    #[test]
+    fn load_fio_engine_swaps_default_binary_and_port() {
+        // Regression: engine: fio with default clients used to inherit
+        // elbencho's binary path + service port, so the master invoked
+        // elbencho with fio flags ("unrecognised option
+        // '--output-format=json'").
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("c.yaml");
+        std::fs::write(
+            &path,
+            r#"
+version: 1
+engine: fio
+clients:
+  - host: worker-01
+  - host: worker-02
+    elbencho_path: /opt/fio/bin/fio
+    service_port: 9000
+targets:
+  - name: t
+    kind: posix
+    mount_path: /mnt
+workloads:
+  - name: w
+    block_size: 4096
+    file_size: 4096
+runs:
+  - target: t
+    workload: w
+"#,
+        )
+        .unwrap();
+        let plan = load(&path).unwrap();
+        // Untouched defaults swap to fio's.
+        assert_eq!(plan.clients[0].elbencho_path, "fio");
+        assert_eq!(plan.clients[0].service_port, 8765);
+        // Explicit values stay.
+        assert_eq!(plan.clients[1].elbencho_path, "/opt/fio/bin/fio");
+        assert_eq!(plan.clients[1].service_port, 9000);
+    }
+
+    #[test]
+    fn load_elbencho_engine_keeps_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("c.yaml");
+        std::fs::write(
+            &path,
+            r#"
+version: 1
+clients:
+  - host: worker-01
+targets:
+  - name: t
+    kind: posix
+    mount_path: /mnt
+workloads:
+  - name: w
+    block_size: 4096
+    file_size: 4096
+runs:
+  - target: t
+    workload: w
+"#,
+        )
+        .unwrap();
+        let plan = load(&path).unwrap();
+        assert_eq!(plan.clients[0].elbencho_path, "elbencho");
+        assert_eq!(plan.clients[0].service_port, 1611);
     }
 
     #[test]
