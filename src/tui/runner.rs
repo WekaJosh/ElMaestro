@@ -137,7 +137,11 @@ pub fn execute(config: &Path, tx: Sender<RunEvent>) {
 
 /// Execute an in-memory RunPlan, optionally repeating the whole sweep N times
 /// for variance analysis. Each repetition lands in its own run directory.
-pub fn execute_plan(plan: RunPlan, label: &str, repeats: usize, tx: Sender<RunEvent>) {
+pub fn execute_plan(mut plan: RunPlan, label: &str, repeats: usize, tx: Sender<RunEvent>) {
+    // Backstop for plans that didn't come through the YAML loader (the
+    // Configure form, loaded templates): repair engine-mismatched client
+    // defaults (fio engine + elbencho binary path/port) before running.
+    plan.normalize_engine_defaults();
     let repeats = repeats.max(1);
     for iter in 0..repeats {
         let iter_label = if repeats > 1 {

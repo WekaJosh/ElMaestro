@@ -805,13 +805,21 @@ fn build_plan(fields: &[Field]) -> Result<(RunPlan, String, usize)> {
         )
     };
 
+    let engine_path_default = match engine {
+        Engine::Elbencho => "elbencho",
+        Engine::Fio => "fio",
+    };
     let clients: Vec<ClientHost> = if workers.is_empty() {
-        vec![ClientHost::default()]
+        // Localhost run. ClientHost::default() carries elbencho's binary
+        // path + service port, which is wrong for fio (the master would
+        // invoke elbencho with fio flags). Build the client engine-aware,
+        // honoring an explicit Service port if one was typed.
+        vec![ClientHost {
+            elbencho_path: engine_path_default.into(),
+            service_port: explicit_svc_port.unwrap_or(default_service_port),
+            ..Default::default()
+        }]
     } else {
-        let engine_path_default = match engine {
-            Engine::Elbencho => "elbencho",
-            Engine::Fio => "fio",
-        };
         let mut out: Vec<ClientHost> = Vec::new();
         // Bash-style brace expansion: `10.10.10.{1..100}` → 100 entries,
         // `node{01..16}` → "node01".."node16", `gpu{a,b,c}` → 3 hosts,
@@ -1294,6 +1302,28 @@ mod tests {
         let (plan, _, _) = build_plan(&fields).expect("plan should validate");
         assert_eq!(plan.clients.len(), 1);
         assert_eq!(plan.clients[0].host, "localhost");
+    }
+
+    #[test]
+    fn fio_engine_blank_workers_gets_fio_binary_and_port() {
+        // Regression: blank Workers used ClientHost::default() (elbencho
+        // binary + port 1611) even with Engine=fio, so localhost fio runs
+        // invoked elbencho with fio flags.
+        let mut fields = default_fields();
+        select_radio(&mut fields, "Engine", "fio");
+        let (plan, _, _) = build_plan(&fields).expect("plan should validate");
+        assert_eq!(plan.clients.len(), 1);
+        assert_eq!(plan.clients[0].elbencho_path, "fio");
+        assert_eq!(plan.clients[0].service_port, 8765);
+    }
+
+    #[test]
+    fn fio_engine_blank_workers_honors_explicit_service_port() {
+        let mut fields = default_fields();
+        select_radio(&mut fields, "Engine", "fio");
+        set_text(&mut fields, "Service port", "9999");
+        let (plan, _, _) = build_plan(&fields).expect("plan should validate");
+        assert_eq!(plan.clients[0].service_port, 9999);
     }
 
     #[test]
