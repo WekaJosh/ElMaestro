@@ -98,8 +98,41 @@ pub async fn bring_up(
         let host = runner.client.host.clone();
         start_tasks.push(tokio::spawn(async move {
             let svc_argv: Vec<&str> = svc_cmd.iter().map(|s| s.as_str()).collect();
-            let _bg = runner.start_background(&svc_argv).await?;
-            wait_for_service(&host, port, 30, Duration::from_millis(500)).await?;
+            let bg = runner.start_background(&svc_argv).await?;
+            if let Err(probe_err) =
+                wait_for_service(&host, port, 30, Duration::from_millis(500)).await
+            {
+                // The #1 cause is the service process dying instantly
+                // (missing binary, bad flag, port already bound). Its
+                // stdout/stderr landed in the remote log file — pull the
+                // tail back so the user sees WHY instead of a bare
+                // "never came up". The #2 cause is a firewall between
+                // the coordinator and the worker; a clean log points
+                // there.
+                let tail_cmd = format!("tail -n 5 {} 2>/dev/null", bg.log_file);
+                let log_tail = runner
+                    .run(&["sh", "-c", &tail_cmd], Some(Duration::from_secs(5)))
+                    .await
+                    .ok()
+                    .map(|r| r.stdout.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                return Err(match log_tail {
+                    Some(log) => anyhow!(
+                        "{}; remote service log says: {} (service cmd: {})",
+                        probe_err,
+                        log,
+                        svc_cmd.join(" ")
+                    ),
+                    None => anyhow!(
+                        "{}; remote service log is empty — the service \
+                         process likely started but the port is \
+                         unreachable from this machine (firewall?). \
+                         service cmd: {}",
+                        probe_err,
+                        svc_cmd.join(" ")
+                    ),
+                });
+            }
             Ok::<ServiceEndpoint, anyhow::Error>(ServiceEndpoint {
                 host,
                 port,

@@ -210,9 +210,13 @@ impl Backend for FioBackend {
     }
 
     fn service_command(&self, client: &ClientHost) -> Vec<String> {
+        // fio server endpoint syntax is `<type>:<host>,<port>`; a leading
+        // comma means "all interfaces". `--server=,8765` listens on every
+        // interface, port 8765. (The pre-v1.9.1 `,N:port` form made fio
+        // exit instantly with "bad server port 0".)
         vec![
             client.elbencho_path.clone(),
-            format!("--server=,N:{}", client.service_port),
+            format!("--server=,{}", client.service_port),
         ]
     }
 }
@@ -699,7 +703,7 @@ mod tests {
         };
         assert_eq!(
             backend.service_command(&client),
-            vec!["/usr/local/bin/fio", "--server=,N:8765"]
+            vec!["/usr/local/bin/fio", "--server=,8765"]
         );
     }
 }
