@@ -18,6 +18,16 @@ pub mod fio;
 pub use elbencho::ElbenchoBackend;
 pub use fio::FioBackend;
 
+/// Point-in-time stats parsed from an engine's live output while a run
+/// is still in flight. Values are cumulative-so-far averages (fio) or
+/// the latest interval (elbencho); either way they're for the Run
+/// screen's live display, not for the final report.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LiveStats {
+    pub throughput_mib_s: Option<f64>,
+    pub iops: Option<f64>,
+}
+
 /// Parsed output of `<binary> --version`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EngineVersion {

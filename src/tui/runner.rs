@@ -60,6 +60,18 @@ pub enum RunEvent {
     SpecStarted {
         index: usize,
     },
+    /// Periodic (~1s) progress for the running spec, emitted by a watcher
+    /// thread that tails the engine's live output. `remaining_s` is only
+    /// present during the measure phase of a duration-bound workload.
+    SpecProgress {
+        index: usize,
+        /// "layout" while the dataset-staging pass runs, "measure" after.
+        phase: String,
+        elapsed_s: u64,
+        remaining_s: Option<u64>,
+        throughput_mib_s: Option<f64>,
+        iops: Option<f64>,
+    },
     SpecFinished {
         index: usize,
         status: SpecStatus,
@@ -222,8 +234,29 @@ fn execute_one_iteration(plan: &RunPlan, label: &str, tx: &Sender<RunEvent>) -> 
         let started = Utc::now();
         let _ = tx.send(RunEvent::SpecStarted { index: idx + 1 });
 
+        // Progress watcher: tails the engine's live output (elbencho
+        // live.csv / fio --status-interval dumps) once a second and
+        // feeds SpecProgress events to the Run screen while run_spec
+        // blocks below.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = {
+            let stop = stop.clone();
+            let tx = tx.clone();
+            let spec_dir = spec_dir.clone();
+            let engine = plan.engine;
+            let duration_s = spec.workload.duration_s;
+            let index = idx + 1;
+            std::thread::spawn(move || {
+                watch_progress(index, engine, &spec_dir, duration_s, &tx, &stop)
+            })
+        };
+
+        let run_res = crate::engine::run_spec(spec, &spec_dir, None, backend.as_ref());
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = watcher.join();
+
         let (status, report_path, result_path, metrics) =
-            match crate::engine::run_spec(spec, &spec_dir, None, backend.as_ref()) {
+            match run_res {
                 Ok(result) => {
                     let json = serde_json::to_string_pretty(&result)?;
                     let result_path = spec_dir.join("result.json");
@@ -354,4 +387,80 @@ pub fn plan_pairs(config: &Path) -> Result<Vec<(Option<sweep::SweepPoint>, RunSp
 /// Expand an in-memory plan (used by the configure-screen flow).
 pub fn plan_pairs_from(plan: &RunPlan) -> Result<Vec<(Option<sweep::SweepPoint>, RunSpec)>> {
     sweep::materialize_run_refs(plan)
+}
+
+/// Progress watcher for one running spec. Runs on its own thread while
+/// the coordinator blocks on the engine; tails the engine's live output
+/// and emits a SpecProgress event roughly once a second until `stop` is
+/// set. Best-effort throughout — if live files never appear (engine too
+/// old for --livecsv / --status-interval, instant failure, etc.) the
+/// events still carry elapsed time.
+fn watch_progress(
+    index: usize,
+    engine: crate::config::Engine,
+    spec_dir: &Path,
+    duration_s: Option<u64>,
+    tx: &Sender<RunEvent>,
+    stop: &std::sync::atomic::AtomicBool,
+) {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    let live = |dir: &Path| -> Option<crate::backends::LiveStats> {
+        match engine {
+            crate::config::Engine::Elbencho => crate::backends::elbencho::live_metrics(dir),
+            crate::config::Engine::Fio => crate::backends::fio::live_metrics(dir),
+        }
+    };
+
+    let measure_dir = spec_dir.join("raw");
+    let layout_dir = spec_dir.join("raw_layout");
+    let started = Instant::now();
+    let mut measure_started: Option<Instant> = None;
+    let mut last_emit = Instant::now() - Duration::from_secs(2);
+
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        // Check the stop flag 5x per second but only emit once a second,
+        // so teardown between specs stays snappy.
+        std::thread::sleep(Duration::from_millis(200));
+        if last_emit.elapsed() < Duration::from_secs(1) {
+            continue;
+        }
+        last_emit = Instant::now();
+
+        let measure_stats = live(&measure_dir);
+        // Once the measure phase produces live output, it stays the
+        // active phase; a layout pass never follows measure.
+        if measure_stats.is_some() && measure_started.is_none() {
+            measure_started = Some(Instant::now());
+        }
+        let (phase, stats) = if measure_started.is_some() {
+            ("measure", measure_stats)
+        } else if let Some(l) = live(&layout_dir) {
+            ("layout", Some(l))
+        } else if layout_dir.is_dir() {
+            ("layout", None)
+        } else {
+            ("starting", None)
+        };
+
+        let remaining_s = match (phase, duration_s, measure_started) {
+            ("measure", Some(d), Some(m0)) => {
+                Some(d.saturating_sub(m0.elapsed().as_secs()))
+            }
+            _ => None,
+        };
+        let stats = stats.unwrap_or_default();
+        let _ = tx.send(RunEvent::SpecProgress {
+            index,
+            phase: phase.into(),
+            elapsed_s: started.elapsed().as_secs(),
+            remaining_s,
+            throughput_mib_s: stats.throughput_mib_s,
+            iops: stats.iops,
+        });
+    }
 }

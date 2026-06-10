@@ -496,7 +496,9 @@ impl RunScreen {
             .map(|r| {
                 let status_style = match r.status.as_str() {
                     "completed" => Style::default().fg(Color::Rgb(0x3f, 0xb9, 0x50)),
-                    "running" => Style::default().fg(Color::Rgb(0xd2, 0x99, 0x22)),
+                    "running…" | "layout…" | "starting…" => {
+                        Style::default().fg(Color::Rgb(0xd2, 0x99, 0x22))
+                    }
                     "error" => Style::default().fg(Color::Rgb(0xf8, 0x51, 0x49)),
                     s if s.starts_with("failed") => {
                         Style::default().fg(Color::Rgb(0xf8, 0x51, 0x49))
@@ -530,7 +532,7 @@ impl RunScreen {
             Constraint::Length(14),
             Constraint::Length(14),
             Constraint::Length(10),
-            Constraint::Length(7),
+            Constraint::Length(9), // dur: fits "120s left"
             Constraint::Length(13),
             Constraint::Length(9),
             Constraint::Length(10),
@@ -643,7 +645,39 @@ impl RunScreen {
             }
             RunEvent::SpecStarted { index } => {
                 if let Some(row) = self.rows.iter_mut().find(|r| r.idx == index) {
-                    row.status = "running".into();
+                    row.status = "starting…".into();
+                }
+            }
+            RunEvent::SpecProgress {
+                index,
+                phase,
+                elapsed_s,
+                remaining_s,
+                throughput_mib_s,
+                iops,
+            } => {
+                if let Some(row) = self.rows.iter_mut().find(|r| r.idx == index) {
+                    row.status = match phase.as_str() {
+                        "layout" => "layout…".into(),
+                        "measure" => "running…".into(),
+                        _ => "starting…".into(),
+                    };
+                    // Time-bound measure shows countdown (more useful than
+                    // elapsed); everything else shows elapsed.
+                    row.duration = match remaining_s {
+                        Some(r) => format!("{}s left", r),
+                        None => format!("{}s", elapsed_s),
+                    };
+                    // Live numbers light up the metrics columns while the
+                    // engine runs; SpecFinished replaces them with finals.
+                    if throughput_mib_s.is_some() || iops.is_some() {
+                        row.metrics = Some(SpecMetrics {
+                            primary_phase: phase,
+                            throughput_mib_s,
+                            iops,
+                            ..Default::default()
+                        });
+                    }
                 }
             }
             RunEvent::SpecFinished {

@@ -99,6 +99,11 @@ impl Backend for ElbenchoBackend {
         argv.extend(["--jsonfile", jsonfile.to_string_lossy().as_ref()].map(String::from));
         argv.extend(["--resfile", resfile.to_string_lossy().as_ref()].map(String::from));
         argv.extend(["--latpercent", "--latpercent9s", "3"].map(String::from));
+        // Live stats once a second, feeding the Run screen's progress
+        // display (see live_metrics below).
+        let livecsv = raw_dir.join("live.csv");
+        argv.extend(["--livecsv", livecsv.to_string_lossy().as_ref()].map(String::from));
+        argv.extend(["--liveint", "1000"].map(String::from));
 
         // Multi-client fan-out.
         if let Some(h) = hosts {
@@ -261,6 +266,55 @@ impl Backend for ElbenchoBackend {
             client.service_port.to_string(),
         ]
     }
+}
+
+// ---------------------------------------------------------------------------
+// Live stats (--livecsv)
+// ---------------------------------------------------------------------------
+
+/// Best-effort live stats for a run in flight: read raw/live.csv (written
+/// once a second via --livecsv/--liveint) and take the last data line.
+/// Column positions are resolved from the header by name so this survives
+/// elbencho column reordering; separator is sniffed (',' vs ';'). Any
+/// parse trouble returns None — the Run screen just shows elapsed time.
+pub fn live_metrics(raw_dir: &Path) -> Option<crate::backends::LiveStats> {
+    let text = std::fs::read_to_string(raw_dir.join("live.csv")).ok()?;
+    parse_live_csv(&text)
+}
+
+fn parse_live_csv(text: &str) -> Option<crate::backends::LiveStats> {
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    let header = lines.next()?;
+    let sep = if header.matches(';').count() > header.matches(',').count() {
+        ';'
+    } else {
+        ','
+    };
+    let cols: Vec<String> = header
+        .split(sep)
+        .map(|c| c.trim().to_ascii_lowercase())
+        .collect();
+    // elbencho names live columns like "MiB/s" / "IOPS" (sometimes with a
+    // phase prefix). Match by substring, first hit wins.
+    let find = |needle: &str| cols.iter().position(|c| c.contains(needle));
+    let tput_idx = find("mib/s");
+    let iops_idx = find("iops");
+    if tput_idx.is_none() && iops_idx.is_none() {
+        return None;
+    }
+    let last = lines.last()?;
+    let fields: Vec<&str> = last.split(sep).map(|f| f.trim()).collect();
+    let grab = |idx: Option<usize>| -> Option<f64> {
+        idx.and_then(|i| fields.get(i)).and_then(|s| s.parse().ok())
+    };
+    let stats = crate::backends::LiveStats {
+        throughput_mib_s: grab(tput_idx),
+        iops: grab(iops_idx),
+    };
+    if stats.throughput_mib_s.is_none() && stats.iops.is_none() {
+        return None;
+    }
+    Some(stats)
 }
 
 // ---------------------------------------------------------------------------
@@ -526,6 +580,32 @@ mod tests {
     use super::*;
     use crate::config::{ClientHost, PosixTarget, S3Target, Workload};
     use tempfile::TempDir;
+
+    #[test]
+    fn live_csv_parses_last_line_by_header_names() {
+        let text = "ISO date,relative time ms,phase,done %,MiB/s,IOPS\n\
+                    2026-06-10T10:00:01,1000,READ,10,3975.5,3975\n\
+                    2026-06-10T10:00:02,2000,READ,20,4100.2,4100\n";
+        let s = parse_live_csv(text).expect("should parse");
+        assert_eq!(s.throughput_mib_s, Some(4100.2));
+        assert_eq!(s.iops, Some(4100.0));
+    }
+
+    #[test]
+    fn live_csv_handles_semicolon_separator() {
+        let text = "time;MiB/s;IOPS\n1;100.0;200\n";
+        let s = parse_live_csv(text).expect("should parse");
+        assert_eq!(s.throughput_mib_s, Some(100.0));
+        assert_eq!(s.iops, Some(200.0));
+    }
+
+    #[test]
+    fn live_csv_none_when_columns_missing_or_empty() {
+        assert!(parse_live_csv("a,b,c\n1,2,3\n").is_none());
+        assert!(parse_live_csv("").is_none());
+        // Header only, no data rows yet.
+        assert!(parse_live_csv("time,MiB/s,IOPS\n").is_none());
+    }
 
     fn make_spec(target: Target, wl: Workload) -> RunSpec {
         RunSpec {

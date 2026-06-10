@@ -155,6 +155,10 @@ impl Backend for FioBackend {
         let mut argv: Vec<String> = vec![local_path.into()];
         argv.push("--output-format=json".into());
         argv.push(format!("--output={}", json_out.display()));
+        // Periodic full status dump appended to the output file. Feeds the
+        // Run screen's live progress display; the final parse always takes
+        // the LAST complete JSON object (see load_fio_json).
+        argv.push("--status-interval=1".into());
         if let Some(h) = hosts {
             // fio's --client takes "host,port" (comma); our hosts string uses
             // "host:port" (colon) from the elbencho convention. Translate.
@@ -214,26 +218,92 @@ impl Backend for FioBackend {
 }
 
 // ---------------------------------------------------------------------------
-// JSON loader: tolerate the host-prefixed preamble fio writes in client mode
+// JSON loader. The output file may contain, in any combination: a
+// host-prefixed preamble (client mode), MULTIPLE concatenated JSON dumps
+// (--status-interval appends a cumulative dump every second), and a
+// truncated trailing object (read mid-write). We always want the LAST
+// complete top-level object — during the run that's the freshest live
+// dump, after the run it's fio's final summary.
 // ---------------------------------------------------------------------------
 
 fn load_fio_json(path: &Path) -> Option<serde_json::Value> {
     let text = std::fs::read_to_string(path).ok()?;
-    // Happy path: pure JSON.
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-        return Some(v);
-    }
-    // Fallback: find the first line that starts with '{' and parse from there.
-    let mut start_idx: Option<usize> = None;
-    for (i, line) in text.lines().enumerate() {
-        if line.starts_with('{') {
-            start_idx = Some(i);
-            break;
+    last_complete_json(&text)
+}
+
+/// Scan for top-level `{...}` spans (brace-depth counting, string- and
+/// escape-aware) and parse the last complete one. Text outside objects
+/// (preambles, log lines between dumps) is ignored.
+fn last_complete_json(text: &str) -> Option<serde_json::Value> {
+    let bytes = text.as_bytes();
+    let mut last_span: Option<(usize, usize)> = None;
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' if depth > 0 => in_string = true,
+            b'{' => {
+                if depth == 0 {
+                    start = i;
+                }
+                depth += 1;
+            }
+            b'}' => {
+                if depth > 0 {
+                    depth -= 1;
+                    if depth == 0 {
+                        last_span = Some((start, i + 1));
+                    }
+                }
+            }
+            _ => {}
         }
     }
-    let start = start_idx?;
-    let tail: String = text.lines().skip(start).collect::<Vec<_>>().join("\n");
-    serde_json::from_str::<serde_json::Value>(&tail).ok()
+    let (s, e) = last_span?;
+    serde_json::from_str::<serde_json::Value>(&text[s..e]).ok()
+}
+
+/// Best-effort live stats for a run in flight: parse the freshest
+/// complete dump in raw/run.json and sum throughput/IOPS across the
+/// phases present. Returns None until fio's first --status-interval
+/// dump lands.
+pub fn live_metrics(raw_dir: &Path) -> Option<crate::backends::LiveStats> {
+    let (_, json_path, _) = artifact_paths(raw_dir);
+    let value = load_fio_json(&json_path)?;
+    let phases = phases_from_fio_json(&value);
+    if phases.is_empty() {
+        return None;
+    }
+    let mut tput = 0.0f64;
+    let mut iops = 0.0f64;
+    let mut have_tput = false;
+    let mut have_iops = false;
+    for p in phases.values() {
+        if let Some(t) = p.throughput_mib_s_last.or(p.throughput_mib_s_first) {
+            tput += t;
+            have_tput = true;
+        }
+        if let Some(i) = p.iops_last.or(p.iops_first) {
+            iops += i;
+            have_iops = true;
+        }
+    }
+    Some(crate::backends::LiveStats {
+        throughput_mib_s: have_tput.then_some(tput),
+        iops: have_iops.then_some(iops),
+    })
 }
 
 fn phases_from_fio_json(data: &serde_json::Value) -> HashMap<String, PhaseResult> {
@@ -362,6 +432,36 @@ mod tests {
     use crate::config::{PosixTarget, S3Target, Workload};
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn last_complete_json_takes_freshest_dump() {
+        // --status-interval appends one cumulative dump per second; the
+        // parser must take the LAST complete object and ignore both the
+        // client-mode preamble and a truncated trailing write.
+        let text = r#"hostname: w1, be=1
+{"jobs": [{"read": {"iops": 100.0}}]}
+{"jobs": [{"read": {"iops": 250.0}}]}
+{"jobs": [{"read": {"io"#;
+        let v = last_complete_json(text).expect("should find a complete object");
+        assert_eq!(
+            v["jobs"][0]["read"]["iops"].as_f64(),
+            Some(250.0)
+        );
+    }
+
+    #[test]
+    fn last_complete_json_handles_braces_inside_strings() {
+        let text = r#"{"a": "literal } brace", "b": 1}
+{"a": "x", "b": 2}"#;
+        let v = last_complete_json(text).expect("complete object");
+        assert_eq!(v["b"].as_i64(), Some(2));
+    }
+
+    #[test]
+    fn last_complete_json_none_for_garbage() {
+        assert!(last_complete_json("no json here").is_none());
+        assert!(last_complete_json("{\"truncated\": ").is_none());
+    }
 
     fn make_spec(target: Target, wl: Workload) -> RunSpec {
         RunSpec {
