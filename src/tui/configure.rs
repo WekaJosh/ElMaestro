@@ -791,10 +791,6 @@ fn build_plan(fields: &[Field]) -> Result<(RunPlan, String, usize)> {
     let jump_host = field_text(fields, "Jump host").trim().to_string();
     let svc_port_raw = field_text(fields, "Service port").trim().to_string();
 
-    let default_service_port: u16 = match engine {
-        Engine::Elbencho => 1611,
-        Engine::Fio => 8765,
-    };
     let explicit_svc_port: Option<u16> = if svc_port_raw.is_empty() {
         None
     } else {
@@ -805,44 +801,35 @@ fn build_plan(fields: &[Field]) -> Result<(RunPlan, String, usize)> {
         )
     };
 
-    let engine_path_default = match engine {
-        Engine::Elbencho => "elbencho",
-        Engine::Fio => "fio",
-    };
+    // The form layer ONLY parses its own sugar here: top-level comma
+    // separation (brace-aware, so `gpu{a,b}` stays one entry) and the
+    // per-entry `:port` suffix. Everything engine- or topology-related —
+    // brace expansion of the host strings, fio-vs-elbencho binary/port
+    // defaults — is handled by RunPlan::finalize() below, the same
+    // pipeline the YAML loader runs. Do not add engine knowledge here.
     let clients: Vec<ClientHost> = if workers.is_empty() {
-        // Localhost run. ClientHost::default() carries elbencho's binary
-        // path + service port, which is wrong for fio (the master would
-        // invoke elbencho with fio flags). Build the client engine-aware,
-        // honoring an explicit Service port if one was typed.
-        vec![ClientHost {
-            elbencho_path: engine_path_default.into(),
-            service_port: explicit_svc_port.unwrap_or(default_service_port),
-            ..Default::default()
-        }]
+        // Localhost run. finalize() repairs the engine-specific binary
+        // path / service port; we only honor an explicitly typed port.
+        let mut c = ClientHost::default();
+        if let Some(p) = explicit_svc_port {
+            c.service_port = p;
+        }
+        vec![c]
     } else {
         let mut out: Vec<ClientHost> = Vec::new();
-        // Bash-style brace expansion: `10.10.10.{1..100}` → 100 entries,
-        // `node{01..16}` → "node01".."node16", `gpu{a,b,c}` → 3 hosts,
-        // cartesian over multiple braces, etc. See config/host_expand.rs.
-        let expanded = crate::config::host_expand::expand_hosts(&workers);
-        for entry in expanded {
+        for entry in crate::config::host_expand::split_top_level_commas(&workers) {
             let entry = entry.trim();
             if entry.is_empty() {
                 continue;
             }
+            // `:port` applies to every host the entry's braces expand to.
+            // Brace syntax never contains ':', so splitting before
+            // expansion is safe.
             let (host, port_str) = match entry.split_once(':') {
                 Some((h, p)) => (h.trim().to_string(), Some(p.trim())),
                 None => (entry.to_string(), None),
             };
-            let port = if let Some(p) = port_str {
-                p.parse::<u16>().map_err(|_| anyhow!(
-                    "Worker {:?} port must be an integer",
-                    entry
-                ))?
-            } else {
-                explicit_svc_port.unwrap_or(default_service_port)
-            };
-            out.push(ClientHost {
+            let mut c = ClientHost {
                 host,
                 ssh_user: if ssh_user.is_empty() {
                     None
@@ -860,9 +847,16 @@ fn build_plan(fields: &[Field]) -> Result<(RunPlan, String, usize)> {
                 } else {
                     Some(jump_host.clone())
                 },
-                elbencho_path: engine_path_default.into(),
-                service_port: port,
-            });
+                ..Default::default()
+            };
+            if let Some(p) = port_str {
+                c.service_port = p.parse::<u16>().map_err(|_| {
+                    anyhow!("Worker {:?} port must be an integer", entry)
+                })?;
+            } else if let Some(p) = explicit_svc_port {
+                c.service_port = p;
+            }
+            out.push(c);
         }
         if out.is_empty() {
             anyhow::bail!("Workers parsed to an empty list");
@@ -918,7 +912,10 @@ fn build_plan(fields: &[Field]) -> Result<(RunPlan, String, usize)> {
         });
     }
 
-    plan.validate()?;
+    // Canonical pipeline: brace expansion + engine-default repair +
+    // validation. Identical to the YAML loader path, so TUI-built plans
+    // execute exactly like file-based ones.
+    plan.finalize()?;
     let label = if has_sweep { "sweep".into() } else { "single".into() };
     Ok((plan, label, repeats))
 }
@@ -1302,6 +1299,19 @@ mod tests {
         let (plan, _, _) = build_plan(&fields).expect("plan should validate");
         assert_eq!(plan.clients.len(), 1);
         assert_eq!(plan.clients[0].host, "localhost");
+    }
+
+    #[test]
+    fn workers_braces_expand_through_finalize_with_port() {
+        // Brace expansion moved from the form layer into
+        // RunPlan::finalize(); prove the TUI path still expands and that
+        // a `:port` suffix applies to every host the entry expands to.
+        let mut fields = default_fields();
+        set_text(&mut fields, "Workers (hosts)", "node{01..03}:1612,extra-01");
+        let (plan, _, _) = build_plan(&fields).expect("plan should validate");
+        let hosts: Vec<&str> = plan.clients.iter().map(|c| c.host.as_str()).collect();
+        assert_eq!(hosts, vec!["node01", "node02", "node03", "extra-01"]);
+        assert!(plan.clients[..3].iter().all(|c| c.service_port == 1612));
     }
 
     #[test]

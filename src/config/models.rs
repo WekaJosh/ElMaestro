@@ -437,6 +437,47 @@ fn default_clients() -> Vec<ClientHost> {
 }
 
 impl RunPlan {
+    /// Canonical plan-preparation pipeline. EVERY plan must pass through
+    /// here exactly once before execution, no matter where it came from
+    /// (YAML file, the TUI Configure form, a loaded template, tests).
+    /// Steps, in order:
+    ///   1. brace-expand client hosts (`10.10.10.{1..100}` → 100 clients)
+    ///   2. repair engine-mismatched client defaults (fio engine with
+    ///      elbencho's binary path / service port)
+    ///   3. cross-field validation
+    /// Idempotent: expanded hosts have no braces left, normalization
+    /// only rewrites untouched defaults, validation is read-only.
+    pub fn finalize(&mut self) -> Result<()> {
+        self.expand_host_braces();
+        self.normalize_engine_defaults();
+        self.validate()
+    }
+
+    /// Replace each client with its brace-expanded set, in place. A
+    /// client whose host has no braces maps to exactly one output client
+    /// (expansion is a no-op for plain hostnames). All other settings
+    /// (ssh user/key/jump, port, engine path) are inherited by every
+    /// expanded entry.
+    fn expand_host_braces(&mut self) {
+        use super::host_expand::expand_hosts;
+        let mut expanded_clients = Vec::with_capacity(self.clients.len());
+        for c in self.clients.drain(..) {
+            let hosts = expand_hosts(&c.host);
+            if hosts.is_empty() {
+                // Preserve the original (likely invalid; validate() will
+                // catch it with a real error message).
+                expanded_clients.push(c);
+                continue;
+            }
+            for h in hosts {
+                let mut clone = c.clone();
+                clone.host = h;
+                expanded_clients.push(clone);
+            }
+        }
+        self.clients = expanded_clients;
+    }
+
     /// Engine-aware default repair. The serde defaults for ClientHost
     /// (binary path "elbencho", service port 1611) are elbencho's, which
     /// is wrong when `engine: fio` — the master would invoke an elbencho
@@ -445,7 +486,7 @@ impl RunPlan {
     /// fio's ("fio", port 8765). Explicitly-set values are left alone: a
     /// user pointing the fio engine at a binary literally named
     /// "elbencho" has no sane meaning, so the swap is safe.
-    pub fn normalize_engine_defaults(&mut self) {
+    fn normalize_engine_defaults(&mut self) {
         if self.engine != Engine::Fio {
             return;
         }

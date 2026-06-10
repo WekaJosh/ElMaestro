@@ -43,11 +43,10 @@ fn home_dir() -> PathBuf {
     }
 }
 
-/// Load a RunPlan from a YAML file. Expands placeholders, parses, then
-/// expands bash-style brace ranges in each client's `host:` field so a
-/// single entry like `host: "10.10.10.{1..100}"` becomes 100 clients
-/// inheriting the rest of the original entry's settings (ssh user / key
-/// / jump host / port / engine path). Finally validates.
+/// Load a RunPlan from a YAML file. Expands ${...} placeholders, parses,
+/// then runs the canonical RunPlan::finalize() pipeline (host brace
+/// expansion, engine-default repair, validation) — the same pipeline the
+/// TUI uses, so file-based and interactive runs behave identically.
 pub fn load(path: &Path) -> Result<RunPlan> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading config: {}", path.display()))?;
@@ -60,33 +59,9 @@ pub fn load(path: &Path) -> Result<RunPlan> {
     let expanded = expand_placeholders(&raw, &config_dir);
     let mut plan: RunPlan = serde_yaml::from_str(&expanded)
         .with_context(|| format!("parsing YAML in {}", path.display()))?;
-    expand_client_brace_ranges(&mut plan);
-    plan.normalize_engine_defaults();
-    plan.validate()
+    plan.finalize()
         .with_context(|| format!("validating {}", path.display()))?;
     Ok(plan)
-}
-
-/// Replace each client with the brace-expanded set, in place. A client
-/// whose host has no braces produces exactly one output client (the
-/// expander is a no-op for plain hostnames).
-fn expand_client_brace_ranges(plan: &mut RunPlan) {
-    use super::host_expand::expand_hosts;
-    let mut expanded_clients = Vec::with_capacity(plan.clients.len());
-    for c in plan.clients.drain(..) {
-        let hosts = expand_hosts(&c.host);
-        if hosts.is_empty() {
-            // Preserve the original (likely invalid; validate() will yell).
-            expanded_clients.push(c);
-            continue;
-        }
-        for h in hosts {
-            let mut clone = c.clone();
-            clone.host = h;
-            expanded_clients.push(clone);
-        }
-    }
-    plan.clients = expanded_clients;
 }
 
 #[cfg(test)]

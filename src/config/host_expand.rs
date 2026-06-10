@@ -203,8 +203,11 @@ fn parse_char_range(s: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// Split `s` on `,` but ignore commas inside `{...}`.
-fn split_top_level_commas(s: &str) -> Vec<String> {
+/// Split `s` on `,` but ignore commas inside `{...}`. Public because the
+/// TUI's Workers field uses it to separate entries before parsing each
+/// entry's `:port` suffix (the brace expansion itself happens later, in
+/// RunPlan::finalize()).
+pub fn split_top_level_commas(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut depth = 0i32;
     let mut current = String::new();

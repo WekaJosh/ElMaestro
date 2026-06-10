@@ -138,10 +138,17 @@ pub fn execute(config: &Path, tx: Sender<RunEvent>) {
 /// Execute an in-memory RunPlan, optionally repeating the whole sweep N times
 /// for variance analysis. Each repetition lands in its own run directory.
 pub fn execute_plan(mut plan: RunPlan, label: &str, repeats: usize, tx: Sender<RunEvent>) {
-    // Backstop for plans that didn't come through the YAML loader (the
-    // Configure form, loaded templates): repair engine-mismatched client
-    // defaults (fio engine + elbencho binary path/port) before running.
-    plan.normalize_engine_defaults();
+    // Backstop: every plan must pass the canonical finalize() pipeline
+    // (brace expansion, engine-default repair, validation) before
+    // execution. Both current sources (YAML loader, Configure form)
+    // already finalize, and finalize is idempotent — this guarantees the
+    // invariant holds for any future plan source too.
+    if let Err(e) = plan.finalize() {
+        let _ = tx.send(RunEvent::Crashed {
+            message: format!("invalid plan: {:#}", e),
+        });
+        return;
+    }
     let repeats = repeats.max(1);
     for iter in 0..repeats {
         let iter_label = if repeats > 1 {
