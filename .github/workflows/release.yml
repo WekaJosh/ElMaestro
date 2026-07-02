@@ -26,6 +26,12 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             asset: elmaestro-linux-x86_64
+          # Native arm64 build on GitHub's free arm64 runners (public
+          # repos). Static musl, same as x86_64, so it runs on any
+          # aarch64 distro (Grace, Graviton, Ampere, ARM DPUs, ...).
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: elmaestro-linux-arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -98,3 +104,4 @@ jobs:
           files: |
             dist/elmaestro-macos-arm64
             dist/elmaestro-linux-x86_64
+            dist/elmaestro-linux-arm64
