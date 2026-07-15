@@ -4,26 +4,37 @@ Interactive IO benchmarking harness. Drives [elbencho](https://github.com/breune
 
 ## Status
 
-**v1.0.0.** Local POSIX, S3 targets (elbencho), multi-client SSH fan-out, sweep expansion (cartesian / ladder), compare reports, Textual-style TUI. Single-file binary, 2-3 MB depending on platform.
+Local POSIX, S3 targets (elbencho), multi-client SSH fan-out (keys, password via sshpass, jump hosts), bash-style brace expansion for host lists (`10.10.10.{1..100}`), sweep expansion (cartesian / ladder), explicit dataset-layout phase before read tests, live progress in the TUI, in-TUI report and compare viewers, save/load templates, pre-flight validation (`check`), client hardware capture in every result, HTML reports. Single static binary, 2-3 MB depending on platform.
 
 ## Install
 
-Single-file binary, nothing else needed but the engine you want to drive.
+Single-file binary, nothing else needed but the engine you want to drive. The `latest/download` URLs below always fetch the newest release ([release history](https://github.com/WekaJosh/ElMaestro/releases)).
 
 ```bash
-# Download for your platform (linux x86_64 shown):
+# Pick your platform:
+# Linux x86_64
 curl -L -o /usr/local/bin/elmaestro \
-  https://github.com/WekaJosh/ElMaestro/releases/download/v1.0.0/elmaestro-linux-x86_64
+  https://github.com/WekaJosh/ElMaestro/releases/latest/download/elmaestro-linux-x86_64
+# Linux arm64 (Grace, Graviton, Ampere, ...)
+curl -L -o /usr/local/bin/elmaestro \
+  https://github.com/WekaJosh/ElMaestro/releases/latest/download/elmaestro-linux-arm64
+# macOS (Apple Silicon)
+curl -L -o /usr/local/bin/elmaestro \
+  https://github.com/WekaJosh/ElMaestro/releases/latest/download/elmaestro-macos-arm64
+
 chmod +x /usr/local/bin/elmaestro
 
 # Install the engine on every machine that will run IO:
 #   elbencho: https://github.com/breuner/elbencho/releases (Linux),
 #             build from source on macOS
 #   fio:      apt install fio  /  dnf install fio  /  brew install fio
+# Optional: sshpass on the coordinator if any worker uses password auth.
 
 # Launch (no args opens the TUI):
 elmaestro
 ```
+
+The Linux binaries are static (musl), so they run on any distro regardless of glibc version.
 
 ## Commands
 
@@ -34,7 +45,8 @@ elmaestro                                       # open TUI
 elmaestro version                               # print version
 elmaestro validate examples/single_test.yaml    # parse + show summary
 elmaestro expand   examples/sweep_block_sizes.yaml  # dry-run a sweep
-elmaestro run      examples/single_test.yaml    # execute, write result.json + report.html
+elmaestro check    examples/multi_client.yaml   # pre-flight: ssh, engine binaries, S3, mounts
+elmaestro run      examples/single_test.yaml    # execute (runs check first; --no-check to skip)
 elmaestro report   results/<run-dir>/           # re-render report.html from result.json
 elmaestro compare  results/A/ results/B/        # overlay multiple runs in one HTML
 elmaestro tui      examples/sweep_block_sizes.yaml    # TUI for a specific config
@@ -56,18 +68,23 @@ The Workload model is shared across engines. Each backend translates the common 
 
 **Engine-specific notes:**
 - **elbencho**: POSIX + S3. Requires the binary built with `S3_SUPPORT=1` for S3.
-- **fio**: POSIX only in v1.0. Multi-client via `fio --server` / `--client=host,port`.
+- **fio**: POSIX only. Multi-client via `fio --server` on each worker; the master drives all workers through a generated hosts file.
 
 ## What's in a run
 
 ```
 results/2026-05-25T14-03-11_sweep_bs-scan/
+├── manifest.json            # spec index + sweep axis values (feeds compare)
 ├── 0001_local-tmp_seq-read-base_bs-64KiB/
-│   ├── result.json          # canonical result schema v1.0
+│   ├── result.json          # canonical result schema (incl. client hardware)
 │   ├── report.html          # per-spec Plotly report
+│   ├── raw_layout/          # dataset-staging pass (read tests only)
 │   └── raw/
 │       ├── run.csv          # engine native output (elbencho)
-│       ├── run.json         # engine native output
+│       ├── run.json         # engine native output (fio: one dump per second)
+│       ├── live.csv         # live stats (elbencho)
+│       ├── hosts.list       # workers driven (fio multi-host)
+│       ├── command.txt      # exact engine invocation
 │       ├── stdout.log
 │       └── stderr.log       # only if engine wrote to stderr
 └── ...

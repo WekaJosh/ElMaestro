@@ -160,16 +160,26 @@ impl Backend for FioBackend {
         // the LAST complete JSON object (see load_fio_json).
         argv.push("--status-interval=1".into());
         if let Some(h) = hosts {
-            // fio's --client takes "host,port" (comma); our hosts string uses
-            // "host:port" (colon) from the elbencho convention. Translate.
+            // One --client per host does NOT work for a shared job file:
+            // fio binds the trailing job file only to the LAST --client,
+            // so every other host connects and idles (verified with two
+            // local servers — only one produced IO). The supported way to
+            // run one job on N hosts is a hosts FILE: `--client=<file>`
+            // where each line is "host,port". Our hosts string uses
+            // "host:port" (elbencho convention); translate per line.
+            let mut lines = String::new();
             for hp in h.split(',') {
                 let (host, port) = hp.split_once(':').unwrap_or((hp, ""));
                 if !port.is_empty() {
-                    argv.push(format!("--client={},{}", host, port));
+                    lines.push_str(&format!("{},{}\n", host, port));
                 } else {
-                    argv.push(format!("--client={}", host));
+                    lines.push_str(&format!("{}\n", host));
                 }
             }
+            let hosts_file = raw_dir.join("hosts.list");
+            std::fs::write(&hosts_file, lines)
+                .with_context(|| format!("writing {}", hosts_file.display()))?;
+            argv.push(format!("--client={}", hosts_file.display()));
         }
         argv.push(job_file.to_string_lossy().into_owned());
 
@@ -536,7 +546,10 @@ mod tests {
     }
 
     #[test]
-    fn build_argv_translates_host_port_to_comma_format() {
+    fn build_argv_multi_host_uses_hosts_file() {
+        // Regression: one --client flag per host binds the trailing job
+        // file ONLY to the last flag; the other hosts connect and idle.
+        // Multi-host must go through a hosts file (--client=<file>).
         let tmp = TempDir::new().unwrap();
         let spec = make_spec(
             Target::Posix(PosixTarget {
@@ -550,10 +563,20 @@ mod tests {
         let (argv, _) = FioBackend::new()
             .build_argv(&spec, tmp.path(), "/usr/bin/fio", Some("h1:8765,h2:8765"))
             .unwrap();
-        assert!(argv.contains(&"--client=h1,8765".to_string()));
-        assert!(argv.contains(&"--client=h2,8765".to_string()));
-        // Don't leak the elbencho format.
-        assert!(!argv.iter().any(|a| a == "--client=h1:8765"));
+        // Exactly one --client flag, pointing at the hosts file.
+        let clients: Vec<&String> =
+            argv.iter().filter(|a| a.starts_with("--client=")).collect();
+        assert_eq!(clients.len(), 1);
+        let hosts_file = tmp.path().join("hosts.list");
+        assert_eq!(clients[0], &format!("--client={}", hosts_file.display()));
+        // File content: one "host,port" per line (fio's comma format,
+        // not elbencho's colon format).
+        let content = std::fs::read_to_string(&hosts_file).unwrap();
+        assert_eq!(content, "h1,8765\nh2,8765\n");
+        // The job file must come AFTER --client so it binds to the list.
+        let client_idx = argv.iter().position(|a| a.starts_with("--client=")).unwrap();
+        let job_idx = argv.iter().position(|a| a.ends_with("job.fio")).unwrap();
+        assert!(job_idx > client_idx);
     }
 
     #[test]
