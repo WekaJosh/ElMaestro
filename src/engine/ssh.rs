@@ -249,6 +249,107 @@ pub async fn health_check(client: &ClientHost) -> Result<()> {
     Ok(())
 }
 
+/// Parse an ssh -J style jump spec — `host`, `user@host`, or
+/// `user@host:port` — into a pseudo-ClientHost for talking to the bastion
+/// DIRECTLY (the bastion is the coordinator when a jump host is set; the
+/// engine master runs there). Key and engine path are inherited from the
+/// template worker client. Password auth is intentionally NOT inherited:
+/// the bastion must use keys/agent (sshpass answers only one prompt, and
+/// that one belongs to the workers).
+pub fn bastion_client(jump: &str, template: &ClientHost) -> ClientHost {
+    let j = jump.trim();
+    let (user_part, hostport) = match j.split_once('@') {
+        Some((u, rest)) => (Some(u.to_string()), rest),
+        None => (None, j),
+    };
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((h, p)) => match p.parse::<u16>() {
+            Ok(pn) => (h.to_string(), pn),
+            // Not a port number (e.g. a bare IPv6-ish string) — treat the
+            // whole thing as the host.
+            Err(_) => (hostport.to_string(), 22),
+        },
+        None => (hostport.to_string(), 22),
+    };
+    ClientHost {
+        host,
+        ssh_user: user_part.or_else(|| template.ssh_user.clone()),
+        ssh_port: port,
+        ssh_key: template.ssh_key.clone(),
+        ssh_jump: None,
+        ssh_password: None,
+        elbencho_path: template.elbencho_path.clone(),
+        service_port: template.service_port,
+    }
+}
+
+/// The ssh argv for a host, joined into one shell-quoted string, for
+/// embedding in tar-pipe transfer pipelines.
+fn ssh_cmd_string(client: &ClientHost) -> String {
+    ssh_base_argv(client)
+        .iter()
+        .map(|s| {
+            shlex::try_quote(s)
+                .map(|c| c.into_owned())
+                .unwrap_or_else(|_| s.clone())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Copy the CONTENTS of `local_dir` into `remote_dir` on the host
+/// (created if missing) via a tar pipe — no scp/sftp dependency, one
+/// round trip regardless of file count.
+pub async fn push_dir(client: &ClientHost, local_dir: &std::path::Path, remote_dir: &str) -> Result<()> {
+    let remote_cmd = format!(
+        "mkdir -p {rd} && tar xf - -C {rd}",
+        rd = shlex::try_quote(remote_dir).map(|c| c.into_owned()).unwrap_or_else(|_| remote_dir.into())
+    );
+    let pipeline = format!(
+        "tar cf - -C {ld} . | {ssh} -- {rc}",
+        ld = shlex::try_quote(&local_dir.to_string_lossy()).map(|c| c.into_owned()).unwrap_or_default(),
+        ssh = ssh_cmd_string(client),
+        rc = shlex::try_quote(&remote_cmd).map(|c| c.into_owned()).unwrap_or_default(),
+    );
+    run_pipeline(&pipeline, &client.host).await
+}
+
+/// Copy the CONTENTS of `remote_dir` on the host into `local_dir`
+/// (created if missing) via a tar pipe.
+pub async fn pull_dir(client: &ClientHost, remote_dir: &str, local_dir: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(local_dir)
+        .with_context(|| format!("creating {}", local_dir.display()))?;
+    let remote_cmd = format!(
+        "tar cf - -C {rd} .",
+        rd = shlex::try_quote(remote_dir).map(|c| c.into_owned()).unwrap_or_else(|_| remote_dir.into())
+    );
+    let pipeline = format!(
+        "{ssh} -- {rc} | tar xf - -C {ld}",
+        ssh = ssh_cmd_string(client),
+        rc = shlex::try_quote(&remote_cmd).map(|c| c.into_owned()).unwrap_or_default(),
+        ld = shlex::try_quote(&local_dir.to_string_lossy()).map(|c| c.into_owned()).unwrap_or_default(),
+    );
+    run_pipeline(&pipeline, &client.host).await
+}
+
+async fn run_pipeline(pipeline: &str, host: &str) -> Result<()> {
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(pipeline)
+        .output()
+        .await
+        .with_context(|| format!("running transfer pipeline for {}", host))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "transfer to/from {} failed (exit={}): {}",
+            host,
+            out.status.code().unwrap_or(-1),
+            truncate(&String::from_utf8_lossy(&out.stderr), 300)
+        );
+    }
+    Ok(())
+}
+
 /// Turn a process-spawn failure into something actionable. The big one:
 /// a password-auth client needs `sshpass` on the coordinator, and a bare
 /// "No such file or directory" doesn't tell the user that.
@@ -315,6 +416,45 @@ mod tests {
         assert!(argv.iter().any(|a| a == "-i"));
         assert!(argv.iter().any(|a| a == "/tmp/key"));
         assert!(argv.iter().any(|a| a == "bench@h"));
+    }
+
+    #[test]
+    fn bastion_client_parses_all_jump_forms() {
+        let template = ClientHost {
+            host: "worker".into(),
+            ssh_user: Some("bench".into()),
+            ssh_key: Some("/k".into()),
+            ssh_password: Some("pw".into()),
+            elbencho_path: "fio".into(),
+            ..Default::default()
+        };
+        // bare host
+        let b = bastion_client("bastion", &template);
+        assert_eq!(b.host, "bastion");
+        assert_eq!(b.ssh_port, 22);
+        // user falls back to the template's
+        assert_eq!(b.ssh_user.as_deref(), Some("bench"));
+        // key + engine path inherited; password NEVER inherited
+        assert_eq!(b.ssh_key.as_deref(), Some(std::path::Path::new("/k")));
+        assert_eq!(b.elbencho_path, "fio");
+        assert!(b.ssh_password.is_none());
+        assert!(b.ssh_jump.is_none());
+
+        // user@host
+        let b = bastion_client("admin@bastion", &template);
+        assert_eq!(b.host, "bastion");
+        assert_eq!(b.ssh_user.as_deref(), Some("admin"));
+
+        // user@host:port
+        let b = bastion_client("admin@bastion:2222", &template);
+        assert_eq!(b.host, "bastion");
+        assert_eq!(b.ssh_user.as_deref(), Some("admin"));
+        assert_eq!(b.ssh_port, 2222);
+
+        // trailing non-numeric colon segment is part of the host
+        let b = bastion_client("weird:host", &template);
+        assert_eq!(b.host, "weird:host");
+        assert_eq!(b.ssh_port, 22);
     }
 
     #[test]

@@ -58,10 +58,25 @@ impl ServicesGuard {
 /// `backend.service_command` returns the argv for each client's service
 /// start. Returns the connected endpoints + a guard that the caller must
 /// `shutdown().await` after the run completes.
+/// How the coordinator verifies a worker's service port is accepting
+/// connections after start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeMode {
+    /// TCP-connect from this process. Correct when the master runs here
+    /// and therefore must be able to reach the port itself.
+    FromCoordinator,
+    /// Check on the worker itself over SSH (bash /dev/tcp against
+    /// 127.0.0.1). Used in jump-host mode: the laptop can't reach the
+    /// service ports directly — only the bastion can — so probing
+    /// locally would always fail even when the service is healthy.
+    OnWorker,
+}
+
 pub async fn bring_up(
     backend: &dyn Backend,
     clients: &[ClientHost],
     connect_timeout: Duration,
+    probe_mode: ProbeMode,
 ) -> Result<(Vec<ServiceEndpoint>, ServicesGuard)> {
     // 1. SSH health check across all clients in parallel.
     let mut tasks = Vec::with_capacity(clients.len());
@@ -99,9 +114,13 @@ pub async fn bring_up(
         start_tasks.push(tokio::spawn(async move {
             let svc_argv: Vec<&str> = svc_cmd.iter().map(|s| s.as_str()).collect();
             let bg = runner.start_background(&svc_argv).await?;
-            if let Err(probe_err) =
-                wait_for_service(&host, port, 30, Duration::from_millis(500)).await
-            {
+            let probe_result = match probe_mode {
+                ProbeMode::FromCoordinator => {
+                    wait_for_service(&host, port, 30, Duration::from_millis(500)).await
+                }
+                ProbeMode::OnWorker => wait_for_service_on_worker(&runner, port).await,
+            };
+            if let Err(probe_err) = probe_result {
                 // The #1 cause is the service process dying instantly
                 // (missing binary, bad flag, port already bound). Its
                 // stdout/stderr landed in the remote log file — pull the
@@ -146,6 +165,31 @@ pub async fn bring_up(
     }
 
     Ok((endpoints, ServicesGuard { runners }))
+}
+
+/// Probe the service port from the worker itself: one SSH call running a
+/// retry loop against 127.0.0.1 with bash's /dev/tcp (present on every
+/// mainstream Linux). 30 × 0.5s, mirroring the coordinator-side probe.
+async fn wait_for_service_on_worker(runner: &SshRunner, port: u16) -> Result<()> {
+    let script = format!(
+        "for i in $(seq 1 30); do \
+           (exec 3<>/dev/tcp/127.0.0.1/{p}) 2>/dev/null && exit 0; \
+           sleep 0.5; \
+         done; exit 1",
+        p = port
+    );
+    let r = runner
+        .run(&["bash", "-c", &script], Some(Duration::from_secs(25)))
+        .await?;
+    if r.ok() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "service never came up on {}:{} (probed from the worker itself)",
+            runner.host(),
+            port
+        ))
+    }
 }
 
 async fn wait_for_service(

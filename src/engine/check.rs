@@ -173,22 +173,44 @@ async fn run_check_async(plan: &RunPlan) -> CheckReport {
     let backend = get_backend(plan.engine);
     let needs_s3 = plan_needs_s3(plan);
 
-    // Local engine check.
+    // Coordinator engine check. With a jump host configured the bastion
+    // is the coordinator (the engine master runs there), so the check
+    // targets the bastion and the LOCAL machine needs no engine binary
+    // at all.
     let local_binary = plan
         .clients
         .first()
         .map(|c| c.elbencho_path.clone())
         .unwrap_or_else(|| backend.name().to_string());
-    let local = check_local(&local_binary, &*backend);
+    let bastion = plan
+        .clients
+        .first()
+        .and_then(|c| c.ssh_jump.as_deref())
+        .map(str::trim)
+        .filter(|j| !j.is_empty())
+        .map(|j| crate::engine::ssh::bastion_client(j, plan.clients.first().unwrap()));
+    let local = match &bastion {
+        Some(b) => check_coordinator_on_bastion(b, &local_binary).await,
+        None => check_local(&local_binary, &*backend),
+    };
 
     // Collect fatal reasons as we go.
     let mut fatal: Vec<String> = Vec::new();
     if !local.present {
-        fatal.push(format!(
-            "local {} binary not found at {:?}; install it or set clients[0].elbencho_path",
-            backend.name(),
-            local_binary
-        ));
+        match &bastion {
+            Some(b) => fatal.push(format!(
+                "{} not found at {:?} on jump host {} — the bastion acts as \
+                 the coordinator and needs the engine binary installed",
+                backend.name(),
+                local_binary,
+                b.host
+            )),
+            None => fatal.push(format!(
+                "local {} binary not found at {:?}; install it or set clients[0].elbencho_path",
+                backend.name(),
+                local_binary
+            )),
+        }
     } else if needs_s3 && !local.s3_capable {
         fatal.push(format!(
             "local {} doesn't have S3 support compiled in (rebuild with S3_SUPPORT=1 \
@@ -266,6 +288,36 @@ async fn run_check_async(plan: &RunPlan) -> CheckReport {
         local,
         clients: clients_rows,
         fatal,
+    }
+}
+
+/// Coordinator engine check for jump mode: run `<binary> --version` on
+/// the bastion over SSH and parse version + features from its output.
+async fn check_coordinator_on_bastion(bastion: &ClientHost, binary: &str) -> LocalCheck {
+    let label = format!("{} (on jump host {})", binary, bastion.host);
+    let runner = SshRunner::new(bastion.clone());
+    match runner
+        .run(&[binary, "--version"], Some(Duration::from_secs(15)))
+        .await
+    {
+        Ok(r) if r.ok() => {
+            let raw = format!("{}{}", r.stdout, r.stderr);
+            let features = parse_features(&raw);
+            LocalCheck {
+                binary: label,
+                present: true,
+                version: parse_version(&raw),
+                s3_capable: features.iter().any(|f| f.eq_ignore_ascii_case("S3")),
+                features,
+            }
+        }
+        _ => LocalCheck {
+            binary: label,
+            present: false,
+            version: None,
+            features: Vec::new(),
+            s3_capable: false,
+        },
     }
 }
 
@@ -370,7 +422,7 @@ async fn check_one_worker(
     row
 }
 
-fn parse_version(raw: &str) -> Option<String> {
+pub(crate) fn parse_version(raw: &str) -> Option<String> {
     // Matches both elbencho ("version: 3.1.3") and fio ("fio-3.36") shapes.
     let re_elb =
         regex::Regex::new(r"(?i)version[:\s]+v?(\d+\.\d+(?:[.\-]\d+)?[^\s]*)").unwrap();
@@ -384,7 +436,7 @@ fn parse_version(raw: &str) -> Option<String> {
         .map(|m| m.as_str().to_string())
 }
 
-fn parse_features(raw: &str) -> Vec<String> {
+pub(crate) fn parse_features(raw: &str) -> Vec<String> {
     // Real elbencho prints features lowercase ("s3 syncfs syscallh"). Match
     // case-insensitively but emit the canonical capitalized name so callers
     // can do `features.contains(&"S3")` regardless of build output.

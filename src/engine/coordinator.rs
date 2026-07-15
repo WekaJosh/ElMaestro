@@ -54,6 +54,20 @@ fn local_path(spec: &RunSpec) -> String {
         .unwrap_or_else(|| "elbencho".into())
 }
 
+/// The bastion pseudo-client when a jump host is configured. Presence
+/// flips the fan-out into jump mode: the bastion IS the coordinator —
+/// engine version checks, service-port probes, and the master process
+/// all happen there, and the local machine needs neither the engine
+/// binary nor TCP reachability to the workers.
+fn jump_bastion(spec: &RunSpec) -> Option<ClientHost> {
+    let first = spec.clients.first()?;
+    let jump = first.ssh_jump.as_deref()?.trim();
+    if jump.is_empty() {
+        return None;
+    }
+    Some(crate::engine::ssh::bastion_client(jump, first))
+}
+
 /// True when the spec's measured workload needs files to exist before it
 /// runs (any reads in the mix) AND the target is file-based with sizing
 /// fully specified. False for pure writes (the measure phase IS the
@@ -164,13 +178,13 @@ pub fn run_locally(
             &env,
             None,
         )?;
-        let layout_rc = exec.output.status.code().unwrap_or(-1);
+        let layout_rc = exec.exit_code;
         if layout_rc != 0 {
             anyhow::bail!(
                 "layout phase failed (exit={}); see {}/stderr.log: {}",
                 layout_rc,
                 layout_dir.display(),
-                String::from_utf8_lossy(&exec.output.stderr)
+                String::from_utf8_lossy(&exec.stderr)
                     .lines()
                     .next()
                     .unwrap_or("(no stderr)")
@@ -203,15 +217,19 @@ pub fn run_locally(
         phases,
         exec.started,
         exec.finished,
-        exec.output.status.code().unwrap_or(-1),
+        exec.exit_code,
         primary_phase,
-        &String::from_utf8_lossy(&exec.output.stderr),
+        &String::from_utf8_lossy(&exec.stderr),
         &client_systems,
     ))
 }
 
+/// Outcome of one engine invocation, local or on the bastion. Owning
+/// plain fields (not std::process::Output) lets the jump-host path build
+/// one from an SshResult without fabricating an ExitStatus.
 struct PassExec {
-    output: std::process::Output,
+    exit_code: i32,
+    stderr: Vec<u8>,
     command_str: String,
     started: chrono::DateTime<Utc>,
     finished: chrono::DateTime<Utc>,
@@ -259,7 +277,8 @@ fn run_one_local_pass(
 
     Ok((
         PassExec {
-            output,
+            exit_code: output.status.code().unwrap_or(-1),
+            stderr: output.stderr,
             command_str,
             started,
             finished,
@@ -275,14 +294,47 @@ async fn run_fanout(
     backend: &dyn Backend,
 ) -> Result<RunResult> {
     let lp = local_path(spec);
-    let version = backend.detect_version(&lp).with_context(|| {
-        format!(
-            "local {} not found at {:?}; the coordinator machine \
-             needs the binary too (it runs the master process)",
-            backend.name(),
-            lp
-        )
-    })?;
+    let bastion = jump_bastion(spec);
+
+    // Engine version check runs wherever the master will run: on the
+    // bastion in jump mode (the local machine needs NO engine binary
+    // then), locally otherwise.
+    let version = match &bastion {
+        Some(b) => {
+            let runner = crate::engine::ssh::SshRunner::new(b.clone());
+            let r = runner
+                .run(&[lp.as_str(), "--version"], Some(Duration::from_secs(15)))
+                .await
+                .with_context(|| format!("ssh to jump host {}", b.host))?;
+            if !r.ok() {
+                anyhow::bail!(
+                    "{} not found at {:?} on jump host {} — with a jump host \
+                     configured the bastion acts as the coordinator and needs \
+                     the engine binary (exit={}, stderr: {})",
+                    backend.name(),
+                    lp,
+                    b.host,
+                    r.exit_status,
+                    r.stderr.lines().next().unwrap_or("")
+                );
+            }
+            let raw = format!("{}{}", r.stdout, r.stderr);
+            crate::backends::EngineVersion {
+                raw: raw.trim().to_string(),
+                version: crate::engine::check::parse_version(&raw),
+                features: crate::engine::check::parse_features(&raw),
+            }
+        }
+        None => backend.detect_version(&lp).with_context(|| {
+            format!(
+                "local {} not found at {:?}; the coordinator machine \
+                 needs the binary too (it runs the master process). \
+                 If you meant to coordinate from a bastion, set a jump host.",
+                backend.name(),
+                lp
+            )
+        })?,
+    };
     let support = backend.supports_target(&spec.target);
     if !support.supported {
         anyhow::bail!("{}", support.reason);
@@ -292,37 +344,74 @@ async fn run_fanout(
     // have the mount, and creating an empty dir on its local fs would
     // be a footgun (silently masks a missing mount on the workers).
 
-    let mut env: Vec<(String, String)> = std::env::vars().collect();
+    // S3 credentials: resolved locally either way, but tracked separately
+    // so jump mode forwards ONLY the injected pairs to the bastion (never
+    // the whole local environment).
+    let mut injected_env: Vec<(String, String)> = Vec::new();
     if let Target::S3(t) = &spec.target {
-        inject_s3_credentials(&mut env, &t.credentials_ref)?;
+        inject_s3_credentials(&mut injected_env, &t.credentials_ref)?;
     }
+    let mut env: Vec<(String, String)> = std::env::vars().collect();
+    env.extend(injected_env.iter().cloned());
 
     // Bring up engine services on every worker ONCE for both phases.
     // Tearing down between layout and measure would just re-pay the
-    // SSH + service-start cost.
-    let (endpoints, guard) =
-        crate::engine::service::bring_up(backend, &spec.clients, Duration::from_secs(15)).await?;
+    // SSH + service-start cost. In jump mode the port probe runs on each
+    // worker itself — the local machine can't reach the service ports
+    // behind the bastion.
+    let probe_mode = if bastion.is_some() {
+        crate::engine::service::ProbeMode::OnWorker
+    } else {
+        crate::engine::service::ProbeMode::FromCoordinator
+    };
+    let (endpoints, guard) = crate::engine::service::bring_up(
+        backend,
+        &spec.clients,
+        Duration::from_secs(15),
+        probe_mode,
+    )
+    .await?;
     let hosts = crate::engine::service::hosts_arg(&endpoints);
+    // Per-spec scratch dir on the bastion for staged inputs + engine
+    // output files. Removed after the passes complete.
+    let remote_base = format!("/tmp/elmaestro-{}", spec.run_id);
 
     // 1. Layout phase: explicit dataset write before the measured workload.
     let layout_err: Option<String> = if needs_layout(spec) {
         let layout_spec = layout_spec_for(spec);
         let layout_dir = spec_dir.join("raw_layout");
-        match run_one_fanout_pass(
-            &layout_spec,
-            &layout_dir,
-            &lp,
-            timeout_s,
-            backend,
-            &env,
-            &hosts,
-        )
-        .await
-        {
+        let layout_res = match &bastion {
+            Some(b) => {
+                run_one_jump_pass(
+                    &layout_spec,
+                    &layout_dir,
+                    &remote_base,
+                    &lp,
+                    backend,
+                    &injected_env,
+                    &hosts,
+                    b,
+                )
+                .await
+            }
+            None => {
+                run_one_fanout_pass(
+                    &layout_spec,
+                    &layout_dir,
+                    &lp,
+                    timeout_s,
+                    backend,
+                    &env,
+                    &hosts,
+                )
+                .await
+            }
+        };
+        match layout_res {
             Ok((exec, _)) => {
-                let rc = exec.output.status.code().unwrap_or(-1);
+                let rc = exec.exit_code;
                 if rc != 0 {
-                    let snippet = String::from_utf8_lossy(&exec.output.stderr)
+                    let snippet = String::from_utf8_lossy(&exec.stderr)
                         .lines()
                         .filter(|l| !l.trim().is_empty())
                         .take(5)
@@ -344,14 +433,32 @@ async fn run_fanout(
         None
     };
     if let Some(msg) = layout_err {
+        cleanup_remote_base(&bastion, &remote_base).await;
         guard.shutdown().await;
         anyhow::bail!(msg);
     }
 
     // 2. Measure phase.
     let raw_dir = spec_dir.join("raw");
-    let pass_res =
-        run_one_fanout_pass(spec, &raw_dir, &lp, timeout_s, backend, &env, &hosts).await;
+    let pass_res = match &bastion {
+        Some(b) => {
+            run_one_jump_pass(
+                spec,
+                &raw_dir,
+                &remote_base,
+                &lp,
+                backend,
+                &injected_env,
+                &hosts,
+                b,
+            )
+            .await
+        }
+        None => {
+            run_one_fanout_pass(spec, &raw_dir, &lp, timeout_s, backend, &env, &hosts).await
+        }
+    };
+    cleanup_remote_base(&bastion, &remote_base).await;
     guard.shutdown().await;
     let (exec, primary_phase) = pass_res?;
 
@@ -383,9 +490,9 @@ async fn run_fanout(
         phases,
         exec.started,
         exec.finished,
-        exec.output.status.code().unwrap_or(-1),
+        exec.exit_code,
         primary_phase,
-        &String::from_utf8_lossy(&exec.output.stderr),
+        &String::from_utf8_lossy(&exec.stderr),
         &client_systems,
     ))
 }
@@ -436,13 +543,100 @@ async fn run_one_fanout_pass(
 
     Ok((
         PassExec {
-            output,
+            exit_code: output.status.code().unwrap_or(-1),
+            stderr: output.stderr,
             command_str,
             started,
             finished,
         },
         primary_phase,
     ))
+}
+
+/// One master pass executed ON THE BASTION (jump mode). The local machine
+/// stages the engine's input files (job.fio, hosts.list, ...) at a /tmp
+/// path that is IDENTICAL locally and remotely — build_argv embeds
+/// absolute paths in the argv, so staging at the same path keeps them
+/// valid on the bastion. Inputs go over a tar pipe, the master runs over
+/// SSH (holding the session for the duration of the pass), and the
+/// engine's output files are pulled back into the spec's real raw dir so
+/// result parsing is identical to every other mode.
+#[allow(clippy::too_many_arguments)]
+async fn run_one_jump_pass(
+    spec: &RunSpec,
+    real_raw_dir: &Path,
+    remote_base: &str,
+    lp: &str,
+    backend: &dyn Backend,
+    injected_env: &[(String, String)],
+    hosts: &str,
+    bastion: &ClientHost,
+) -> Result<(PassExec, String)> {
+    let pass_name = real_raw_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("raw");
+    let remote_raw = format!("{}/{}", remote_base, pass_name);
+    let staging = std::path::PathBuf::from(&remote_raw);
+
+    let (argv, primary_phase) = backend.build_argv(spec, &staging, lp, Some(hosts))?;
+    let command_str = shell_quote_argv(&argv);
+    crate::engine::ssh::push_dir(bastion, &staging, &remote_raw)
+        .await
+        .with_context(|| format!("staging engine inputs on jump host {}", bastion.host))?;
+
+    // Only the explicitly injected pairs (S3 credentials) go remote —
+    // never the whole local environment.
+    let mut remote_argv: Vec<String> = Vec::new();
+    if !injected_env.is_empty() {
+        remote_argv.push("env".into());
+        for (k, v) in injected_env {
+            remote_argv.push(format!("{}={}", k, v));
+        }
+    }
+    remote_argv.extend(argv.iter().cloned());
+    let argv_refs: Vec<&str> = remote_argv.iter().map(|s| s.as_str()).collect();
+
+    let runner = crate::engine::ssh::SshRunner::new(bastion.clone());
+    let started = Utc::now();
+    let r = runner
+        .run(&argv_refs, None)
+        .await
+        .with_context(|| format!("running {} master on jump host {}", backend.name(), bastion.host))?;
+    let finished = Utc::now();
+
+    crate::engine::ssh::pull_dir(bastion, &remote_raw, real_raw_dir)
+        .await
+        .with_context(|| format!("pulling engine output from jump host {}", bastion.host))?;
+    std::fs::write(real_raw_dir.join("stdout.log"), r.stdout.as_bytes())?;
+    if !r.stderr.is_empty() {
+        std::fs::write(real_raw_dir.join("stderr.log"), r.stderr.as_bytes())?;
+    }
+    let _ = std::fs::write(real_raw_dir.join("command.txt"), &command_str);
+    // Remove the local staging copy; the canonical artifacts now live in
+    // real_raw_dir. The bastion side is removed by cleanup_remote_base.
+    let _ = std::fs::remove_dir_all(&staging);
+
+    Ok((
+        PassExec {
+            exit_code: r.exit_status,
+            stderr: r.stderr.into_bytes(),
+            command_str,
+            started,
+            finished,
+        },
+        primary_phase,
+    ))
+}
+
+/// Best-effort removal of the per-spec scratch dir on the bastion.
+async fn cleanup_remote_base(bastion: &Option<ClientHost>, remote_base: &str) {
+    if let Some(b) = bastion {
+        let runner = crate::engine::ssh::SshRunner::new(b.clone());
+        let _ = runner
+            .run(&["rm", "-rf", remote_base], Some(Duration::from_secs(10)))
+            .await;
+    }
 }
 
 fn run_with_timeout(mut command: Command, timeout: Duration) -> Result<std::process::Output> {
