@@ -88,7 +88,11 @@ pub fn ssh_base_argv(client: &ClientHost) -> Vec<String> {
     }
     if let Some(jump) = &client.ssh_jump {
         let j = jump.trim();
-        if !j.is_empty() {
+        // Skip the hop when this client IS the jump host: `ssh -J bastion
+        // bastion` tunnels to the bastion through itself, which fails
+        // with ssh exit 255. The bastion is directly reachable by
+        // definition, so connect straight to it.
+        if !j.is_empty() && jump_host_part(j) != client.host {
             argv.push("-J".into());
             argv.push(j.to_string());
         }
@@ -283,6 +287,17 @@ pub fn bastion_client(jump: &str, template: &ClientHost) -> ClientHost {
     }
 }
 
+/// Just the host portion of a jump spec: strips `user@` and a trailing
+/// numeric `:port`. Used to detect the jump-host-is-also-a-worker case.
+fn jump_host_part(jump: &str) -> String {
+    let j = jump.trim();
+    let hostport = j.split_once('@').map(|(_, rest)| rest).unwrap_or(j);
+    match hostport.rsplit_once(':') {
+        Some((h, p)) if p.parse::<u16>().is_ok() => h.to_string(),
+        _ => hostport.to_string(),
+    }
+}
+
 /// The ssh argv for a host, joined into one shell-quoted string, for
 /// embedding in tar-pipe transfer pipelines.
 fn ssh_cmd_string(client: &ClientHost) -> String {
@@ -416,6 +431,32 @@ mod tests {
         assert!(argv.iter().any(|a| a == "-i"));
         assert!(argv.iter().any(|a| a == "/tmp/key"));
         assert!(argv.iter().any(|a| a == "bench@h"));
+    }
+
+    #[test]
+    fn jump_host_that_is_also_a_worker_connects_directly() {
+        // `ssh -J bastion bastion` tunnels through itself and dies with
+        // exit 255. When the client IS the jump host, drop -J entirely.
+        for jump in ["10.0.0.1", "admin@10.0.0.1", "admin@10.0.0.1:2222"] {
+            let argv = ssh_base_argv(&ClientHost {
+                host: "10.0.0.1".into(),
+                ssh_jump: Some(jump.into()),
+                ..Default::default()
+            });
+            assert!(
+                !argv.iter().any(|a| a == "-J"),
+                "expected no -J for jump={:?}, got {:?}",
+                jump,
+                argv
+            );
+        }
+        // Other workers still hop through the bastion.
+        let argv = ssh_base_argv(&ClientHost {
+            host: "10.0.0.2".into(),
+            ssh_jump: Some("admin@10.0.0.1:2222".into()),
+            ..Default::default()
+        });
+        assert!(argv.iter().any(|a| a == "-J"));
     }
 
     #[test]

@@ -70,7 +70,7 @@ The Workload model is shared across engines. Each backend translates the common 
 - **elbencho**: POSIX + S3. Requires the binary built with `S3_SUPPORT=1` for S3.
 - **fio**: POSIX only. Multi-client via `fio --server` on each worker; the master drives all workers through a generated hosts file.
 
-**Jump hosts:** when a client sets `ssh_jump` (or the TUI's Jump host field), the bastion becomes the coordinator: the engine master process runs there, engine version checks target it, and service-port probes run on the workers themselves. Your laptop needs neither the engine binary nor network reachability to the workers — only SSH to the bastion. The bastion needs the engine binary and must authenticate with keys/agent (worker passwords still work via sshpass). Accepts `host`, `user@host`, or `user@host:port`.
+**Jump hosts:** when a client sets `ssh_jump` (or the TUI's Jump host field), the bastion becomes the coordinator: the engine master process runs there, engine version checks target it, and service-port probes run on the workers themselves. Your laptop needs neither the engine binary nor network reachability to the workers — only SSH to the bastion. The bastion needs the engine binary and must authenticate with keys/agent (worker passwords still work via sshpass). Accepts `host`, `user@host`, or `user@host:port`. The jump host may itself be one of the workers — elmaestro connects to it directly instead of hopping through itself.
 
 ## What's in a run
 
